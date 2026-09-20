@@ -1,0 +1,146 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the README promises; 3.13 is what people have.
+        # Both platforms, because andy claims to run on both.
+        os: [macos-latest, ubuntu-latest]
+        python: ["3.9", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: it parses on this version
+        run: python -m compileall -q andy tests
+
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: it runs on a real tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          mkdir -p "$root/app/node_modules" "$root/svc/target" "$root/svc/.git"
+          : > "$root/app/package.json"
+          : > "$root/svc/Cargo.toml"
+          dd if=/dev/zero of="$root/app/node_modules/big.bin" bs=1024 count=6144 2>/dev/null
+          dd if=/dev/zero of="$root/svc/target/out.bin"       bs=1024 count=4096 2>/dev/null
+
+          # A fresh empty HOME per run, so each depends on the tree above and
+          # nothing else -- including andy's own cache, which the first run
+          # would otherwise leave under ~/.cache for the second one to measure.
+          fresh_home() { export HOME="$(mktemp -d)"; export XDG_CACHE_HOME="$HOME/.cache"; }
+
+          fresh_home
+          python andy --json --fresh "$root" > out.json
+          python - <<'PY'
+          import json, sys
+          doc = json.load(open("out.json"))
+          assert doc["mapped_bytes"] >= 10 * 2**20, doc["mapped_bytes"]
+          assert sum(c["bytes"] for c in doc["categories"]) == doc["mapped_bytes"]
+          labels = {c["label"] for c in doc["categories"]}
+          assert "project artifacts" in labels, labels
+          assert doc["platform"] in ("darwin", "linux"), doc["platform"]
+          print("json ok:", doc["mapped_bytes"], "bytes,", doc["platform"])
+          PY
+
+          # the in-process engine must agree with du to the byte
+          fresh_home
+          python andy --json --fresh --walk "$root" > walk.json
+          python - <<'PY'
+          import json
+          a = json.load(open("out.json"))["mapped_bytes"]
+          b = json.load(open("walk.json"))["mapped_bytes"]
+          assert a == b, f"du said {a}, the walker said {b}"
+          print("both engines agree:", a)
+          PY
+
+          # the other output formats, and the promise that --commands runs nothing
+          fresh_home
+          python andy --fresh -n 5 "$root" > /dev/null
+          python andy --tree --fresh "$root" > /dev/null
+          python andy --commands --fresh -m 1M "$root" > cmds.sh
+          if grep -vqE '^(#.*)?$' cmds.sh; then
+            echo "--commands emitted an executable line:"; cat cmds.sh; exit 1
+          fi
+
+          # -i without a terminal is an error, not a traceback
+          if python andy -i "$root"; then echo "-i should have failed"; exit 1; fi
+          echo "all good"
+
+  # The clipboard is the one thing andy does that leaves the process, and the
+  # only way to know it works is to give it a display server and read the
+  # clipboard back. Linux only: macOS has pbcopy and no headless session.
+  clipboard:
+    name: clipboard · wayland and x11
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: install display servers and clipboard tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xclip xsel wl-clipboard sway
+
+      - name: x11, via xclip
+        run: |
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 2
+          sudo mv /usr/bin/wl-copy /usr/bin/wl-copy.hidden
+          DISPLAY=:99 python tests/clipboard_check.py x11
+        env:
+          PYTHONPATH: tests
+
+      - name: x11, when only xsel is installed
+        run: |
+          sudo mv /usr/bin/xclip /usr/bin/xclip.hidden
+          DISPLAY=:99 python tests/clipboard_check.py x11-xsel
+          sudo mv /usr/bin/xclip.hidden /usr/bin/xclip
+          sudo mv /usr/bin/wl-copy.hidden /usr/bin/wl-copy
+        env:
+          PYTHONPATH: tests
+
+      - name: wayland, via wl-copy on headless sway
+        run: |
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
+          : > /tmp/sway.conf
+          sway -c /tmp/sway.conf > /tmp/sway.log 2>&1 &
+          for _ in $(seq 1 30); do
+            [ -S "$XDG_RUNTIME_DIR/wayland-1" ] && break
+            sleep 1
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-1" ]; then cat /tmp/sway.log; exit 1; fi
+          WAYLAND_DISPLAY=wayland-1 python tests/clipboard_check.py wayland
+        env:
+          PYTHONPATH: tests
+
+      - name: nothing installed at all
+        run: |
+          sudo mv /usr/bin/wl-copy /usr/bin/wl-copy.hidden
+          sudo mv /usr/bin/xclip /usr/bin/xclip.hidden
+          sudo mv /usr/bin/xsel /usr/bin/xsel.hidden
+          python tests/clipboard_check.py none
+        env:
+          PYTHONPATH: tests
