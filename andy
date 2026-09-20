@@ -18,18 +18,24 @@ import glob
 import json
 import os
 import plistlib
+import queue
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 from dataclasses import dataclass, field
 
 HOME = os.path.expanduser("~")
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "andy")
 CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+MACOS = sys.platform == "darwin"
+PLATFORM = "darwin" if MACOS else "linux"
+FILE_MANAGER = "Finder" if MACOS else "your file manager"
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -95,52 +101,356 @@ def bar(fraction: float, width: int) -> str:
     return out.ljust(width)
 
 
+# Whoever answers first. Wayland before X11, because a Wayland session usually
+# still has xclip installed and pointing at a display nothing is reading.
+CLIPBOARDS = ((["pbcopy"],) if MACOS else
+              (["wl-copy"], ["xclip", "-selection", "clipboard"],
+               ["xsel", "--clipboard", "--input"]))
+
+
 def clip(text: str) -> bool:
     """Put text on the clipboard. Read-only with respect to the filesystem."""
-    try:
-        p = subprocess.run(["pbcopy"], input=text, text=True, timeout=5)
-        return p.returncode == 0
-    except Exception:
-        return False
-
-
-def _parse_du(text: str) -> dict[str, int]:
-    sizes: dict[str, int] = {}
-    for line in text.splitlines():
-        kb, _, path = line.partition("\t")
-        try:
-            sizes[path] = int(kb.strip()) * 1024
-        except ValueError:
+    for argv in CLIPBOARDS:
+        if not shutil.which(argv[0]):
             continue
-    return sizes
-
-
-def du_batch(paths: list[str], timeout: float = 60.0) -> dict[str, int]:
-    """Measure several paths with one du(1). Returns bytes keyed by path.
-
-    `-x` keeps du on one filesystem, so it never wanders into a network share or
-    a VM mount and reports space that is not on this disk. The timeout matters
-    more than it looks: du on the data directory of a *running* container VM can
-    block on I/O for many minutes at no CPU at all, and without a cap that single
-    directory would stall the whole scan. du prints a line per path as it
-    finishes, so whatever completed before the cap is still salvaged."""
-    if not paths:
-        return {}
-    try:
-        p = subprocess.run(["du", "-skx", *paths],
-                           capture_output=True, text=True, timeout=timeout)
-        return _parse_du(p.stdout)
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "replace")
-        return _parse_du(out)
-    except Exception:
-        return {}
+        try:
+            p = subprocess.run(argv, input=text, text=True, timeout=5,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if p.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def usable_dir(path: str) -> bool:
     return os.path.isdir(path) and not os.path.islink(path)
+
+
+# --------------------------------------------------------------------------- #
+# measurement
+# --------------------------------------------------------------------------- #
+#
+# Everything below runs on daemon threads, and concurrent.futures is deliberately
+# not used anywhere in this program. Its workers are not daemons and it installs
+# an atexit hook that joins them, so one call wedged on filesystem I/O -- which
+# is exactly what a running container VM does to anything that reads its data
+# directory -- would keep andy from exiting. A daemon thread in the same state is
+# simply abandoned, and quitting stays instant. That is the whole reason for the
+# two small classes here rather than four lines of stdlib.
+
+MEASURE_BUDGET = 180.0   # seconds one measurement phase may take, in total
+MEASURE_TICK = 0.12      # how often climbing figures are published to the model
+
+
+class Task:
+    """A function on a daemon thread, with a result you can wait for."""
+
+    def __init__(self, fn, *args) -> None:
+        self._value = None
+        self._done = threading.Event()
+        threading.Thread(target=self._run, args=(fn, args), daemon=True).start()
+
+    def _run(self, fn, args) -> None:
+        try:
+            self._value = fn(*args)
+        except Exception:
+            self._value = None
+        finally:
+            self._done.set()
+
+    def result(self, timeout: float | None = None, default=None):
+        """What the call returned, or `default` if it raised or is still going."""
+        if not self._done.wait(timeout) or self._value is None:
+            return default
+        return self._value
+
+
+class Walk:
+    """One directory being measured, and the total counted for it so far."""
+
+    __slots__ = ("root", "dev", "total", "pending", "seen", "lock")
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self.dev: int | None = None
+        self.total = 0
+        self.pending = 1            # units of work outstanding; 0 means finished
+        self.seen: set[int] = set()  # inodes of multiply-linked files, counted once
+        self.lock = threading.Lock()
+
+    def state(self) -> tuple[int, bool]:
+        with self.lock:
+            return self.total, self.pending <= 0
+
+
+class Measurer:
+    """Measures directories in parallel, publishing totals as they climb.
+
+    Subclasses supply the measuring; this supplies the driving. Work sits in a
+    deque, whose append and popleft are atomic under the GIL and so need no lock
+    of its own -- an earlier version guarded it with a condition variable, and on
+    a disk made of thousands of small directories the contention cost more than
+    the work it coordinated.
+    """
+
+    def __init__(self, workers: int = 8, cancel: threading.Event | None = None) -> None:
+        self.workers = max(1, workers)
+        self.cancel = cancel or threading.Event()
+        self._queue: deque = deque()
+        self._stop = False
+
+    # -- what a subclass provides -------------------------------------------- #
+
+    def _seed(self, walk: Walk) -> bool:
+        """Queue the initial work for one walk. False if it cannot be measured."""
+        raise NotImplementedError
+
+    def _step(self, item) -> None:
+        """Do one unit of queued work, updating its walk."""
+        raise NotImplementedError
+
+    def _cleanup(self) -> None:
+        """Release anything still running. Called once, on the way out."""
+
+    # -- the driving ---------------------------------------------------------- #
+
+    def _worker(self) -> None:
+        idle = 0.0
+        while not self._stop:
+            try:
+                item = self._queue.popleft()
+            except IndexError:
+                # briefly nothing to do: back off instead of spinning on the GIL
+                idle = min(0.02, idle * 2 + 0.0002)
+                time.sleep(idle)
+                continue
+            idle = 0.0
+            try:
+                self._step(item)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop = True
+        self._queue.clear()
+        self._cleanup()
+
+    def run(self, paths: list[str], publish, budget: float = MEASURE_BUDGET) -> None:
+        """Measure every path, calling `publish` with a list of
+        (path, bytes, status) once per tick. Status is "running" while the
+        number is still climbing, "done" when it is exact, and "partial" when
+        the budget expired and it is only a floor."""
+        walks: dict[str, Walk] = {}
+        settled: list[tuple[str, int, str]] = []
+        for path in paths:
+            walk = Walk(path)
+            if self._seed(walk):
+                walks[path] = walk
+            else:
+                # gone between the catalog being built and now: no bytes, no mystery
+                settled.append((path, 0, "done"))
+        if settled:
+            publish(settled)
+        if not walks:
+            return
+
+        for _ in range(self.workers):
+            threading.Thread(target=self._worker, daemon=True,
+                             name="andy-measure").start()
+
+        deadline = time.time() + budget
+        finished: set[str] = set()
+        shown: dict[str, int] = {}
+        try:
+            while len(finished) < len(walks):
+                # `_stop` is stop() called from elsewhere -- a rescan, a quit --
+                # and the workers have already been told. Waiting out the budget
+                # for walks that will never finish would be waiting for nothing.
+                if self.cancel.is_set() or self._stop:
+                    return
+                expired = time.time() >= deadline
+                updates = []
+                for path, walk in walks.items():
+                    if path in finished:
+                        continue
+                    total, complete = walk.state()
+                    if complete:
+                        finished.add(path)
+                        updates.append((path, total, "done"))
+                    elif expired:
+                        finished.add(path)
+                        updates.append((path, total, "partial"))
+                    elif shown.get(path) != total:
+                        shown[path] = total
+                        updates.append((path, total, "running"))
+                if updates:
+                    publish(updates)
+                if len(finished) < len(walks):
+                    time.sleep(MEASURE_TICK)
+        finally:
+            self.stop()
+
+
+class DuMeasurer(Measurer):
+    """Measure with du(1), one process per path, reading its output as it goes.
+
+    `du -kx` without `-s` prints a line for every directory it finishes, and it
+    finishes a directory only after everything inside it -- so the lines arrive
+    in post-order and a running total can be kept exactly: a directory's line
+    already contains the children counted from earlier lines, so those are
+    swapped out for it rather than added again. The figure after the last line
+    is the same number `du -skx` would have printed, and the figures before it
+    are honest floors.
+
+    This is what andy measures with. du is C, it uses the bulk directory calls
+    the platform provides, and a process per path is real parallelism rather
+    than eight Python threads taking turns with the GIL: measured against the
+    in-process Walker on the same disk, it is about twice as fast on large trees
+    and never slower. `-x` keeps it on one filesystem, so a network mount is
+    never reported as local disk.
+    """
+
+    def __init__(self, workers: int = 8, cancel: threading.Event | None = None) -> None:
+        super().__init__(workers, cancel)
+        self._procs: set = set()
+        self._procs_lock = threading.Lock()
+
+    def _seed(self, walk: Walk) -> bool:
+        if not os.path.isdir(walk.root):
+            return False
+        self._queue.append(walk)
+        return True
+
+    def _step(self, walk: Walk) -> None:
+        proc = None
+        try:
+            proc = subprocess.Popen(["du", "-kx", walk.root], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            with self._procs_lock:
+                self._procs.add(proc)
+            child: dict[str, int] = {}
+            for line in proc.stdout:
+                if self._stop:
+                    break
+                kb, _, path = line.rstrip("\n").partition("\t")
+                try:
+                    size = int(kb) * 1024
+                except ValueError:
+                    continue            # a warning, or a path containing a tab
+                gain = size - child.pop(path, 0)
+                parent = os.path.dirname(path)
+                child[parent] = child.get(parent, 0) + size
+                if gain:
+                    with walk.lock:
+                        walk.total += gain
+        except Exception:
+            pass
+        finally:
+            if proc is not None:
+                self._close(proc)
+            with walk.lock:
+                walk.pending = 0
+
+    def _close(self, proc) -> None:
+        with self._procs_lock:
+            self._procs.discard(proc)
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            # du blocked on the I/O of a running VM will not die politely, and
+            # an orphan left reading that disk would outlive andy
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=0.1)
+        except Exception:
+            pass
+
+    def _cleanup(self) -> None:
+        with self._procs_lock:
+            procs = list(self._procs)
+        for proc in procs:
+            self._close(proc)
+
+
+class Walker(Measurer):
+    """Measure in this process, without shelling out to du.
+
+    Sizes are `st_blocks * 512`: blocks actually allocated, which is what `du -k`
+    reports and what the volume gives back when you delete the thing. `st_size`
+    would lie in both directions -- a sparse container disk claims far more than
+    it occupies, a tree of small files occupies far more than it claims.
+
+    Matching `du -skx` otherwise means: never leaving the filesystem the walk
+    started on; counting a symlink's own blocks but never following it; and
+    counting a file with several hard links once. Hard links are deduplicated
+    per walk rather than across the whole scan, which is `du -sk a; du -sk b`
+    rather than `du -skx a b` -- andy reports each location on its own terms,
+    and a file linked into two of them belongs to both.
+
+    Slower than DuMeasurer, because the GIL serialises the per-entry work that
+    du does in C. Kept, and reachable with `--walk`, for the machine where
+    spawning processes is unwelcome or du behaves unlike either of the two
+    implementations this was tested against.
+    """
+
+    def _seed(self, walk: Walk) -> bool:
+        try:
+            st = os.lstat(walk.root)
+        except OSError:
+            return False
+        walk.dev = st.st_dev
+        walk.total = st.st_blocks * 512
+        self._queue.append((walk, walk.root))
+        return True
+
+    def _scan(self, walk: Walk, path: str) -> tuple[int, list[str]]:
+        """One directory: its own entries' blocks, and the subdirectories."""
+        total = 0
+        subdirs: list[str] = []
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if self._stop:
+                        break
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue                  # vanished mid-walk
+                    if st.st_dev != walk.dev:
+                        continue                  # du -x: one filesystem only
+                    is_dir = st.st_mode & 0o170000 == stat.S_IFDIR
+                    if not is_dir and st.st_nlink > 1:
+                        with walk.lock:
+                            if st.st_ino in walk.seen:
+                                continue          # already counted under another name
+                            walk.seen.add(st.st_ino)
+                    total += st.st_blocks * 512
+                    if is_dir:
+                        subdirs.append(entry.path)
+        except OSError:
+            pass                                  # unreadable: du counts nothing either
+        return total, subdirs
+
+    def _step(self, item) -> None:
+        walk, path = item
+        total, subdirs = self._scan(walk, path)
+        if self._stop:
+            return
+        # the net count -- this directory finished, its children queued -- is
+        # applied before the children become visible, so a walk is never seen as
+        # settled while there is still work coming.
+        with walk.lock:
+            walk.total += total
+            walk.pending += len(subdirs) - 1
+        if subdirs:
+            self._queue.extend((walk, sub) for sub in subdirs)
 
 
 # --------------------------------------------------------------------------- #
@@ -172,10 +482,18 @@ class Spec:
     safety: str = SAFE
     expand: str | None = None   # glob for itemised children
     namer: str | None = None    # "simulator" for device.plist lookup
+    only: str | None = None     # the one platform this exists on
 
 
-def S(cat, label, path, note="", cmd="", safety=SAFE, expand=None, namer=None) -> Spec:
-    return Spec(cat, label, os.path.expanduser(path), note, cmd, safety, expand, namer)
+def S(cat, label, path, note="", cmd="", safety=SAFE, expand=None, namer=None,
+      only=None) -> Spec:
+    path = os.path.expanduser(path)
+    if only is None and "/Library/" in path:
+        # Anything under ~/Library or /Library is Apple's layout. usable_dir
+        # would filter these out on Linux anyway; tagging them means `--json`
+        # can say what andy looked at rather than only what it found.
+        only = "darwin"
+    return Spec(cat, label, path, note, cmd, safety, expand, namer, only)
 
 
 CATALOG: list[Spec] = [
@@ -275,6 +593,39 @@ CATALOG: list[Spec] = [
     S(PACKAGES, "conda packages", "~/.conda/pkgs", "Extracted conda packages and tarballs.",
       "conda clean --all"),
 
+    S(PACKAGES, "pnpm cache", "~/Library/Caches/pnpm",
+      "pnpm's metadata and side caches, separate from the content-addressed store.",
+      "pnpm store prune"),
+    S(PACKAGES, "pnpm cache (XDG)", "~/.cache/pnpm",
+      "Where pnpm caches when XDG paths are in force.", "pnpm store prune"),
+    S(PACKAGES, "Julia packages", "~/.julia",
+      "Registries, packages and compiled artifacts. Artifacts dominate it.",
+      "julia -e 'using Pkg; Pkg.gc(collect_delay=Hour(0))'", REBUILD),
+    S(PACKAGES, "Coursier cache", "~/Library/Caches/Coursier",
+      "Scala and JVM dependencies fetched by Coursier / sbt.", "cs cache --delete", REBUILD),
+    S(PACKAGES, "Ivy cache", "~/.ivy2",
+      "Older Scala and Ant dependency cache.", "rm -rf ~/.ivy2/cache", REBUILD),
+    S(PACKAGES, "sbt boot & launchers", "~/.sbt",
+      "sbt's own launchers and boot libraries.", "", REBUILD),
+    S(PACKAGES, "Maven wrapper", "~/.m2/wrapper",
+      "Maven distributions downloaded by mvnw.", "rm -rf ~/.m2/wrapper", REBUILD),
+    S(PACKAGES, "conda environments", "~/.conda/envs",
+      "Conda environments. Each one is a full interpreter and its libraries.",
+      "conda env remove -n <name>", REVIEW, expand="~/.conda/envs/*"),
+    S(PACKAGES, "miniconda", "~/miniconda3",
+      "A miniconda installation: base environment, packages and envs.", "", REVIEW),
+    S(PACKAGES, "anaconda", "~/anaconda3",
+      "An anaconda installation: base environment, packages and envs.", "", REVIEW),
+    S(PACKAGES, "pipenv virtualenvs", "~/.local/share/virtualenvs",
+      "pipenv's environments, one per project. Recreate from Pipfile.lock.",
+      "pipenv --rm   # inside the project", REBUILD),
+    S(PACKAGES, "virtualenvwrapper", "~/.virtualenvs",
+      "Environments made by virtualenvwrapper.", "", REVIEW),
+    S(PACKAGES, "cpanm work", "~/.cpanm",
+      "Perl build directories and the modules cpanm downloaded.",
+      "rm -rf ~/.cpanm/work"),
+    S(PACKAGES, "rebar3 cache", "~/.cache/rebar3",
+      "Erlang dependencies and compiled beams.", "rebar3 clean --all", REBUILD),
     # --------------------------------------------------------- toolchains/runtimes
     S(TOOLCHAINS, "rustup toolchains", "~/.rustup/toolchains",
       "A full Rust toolchain per channel. Old nightlies add up fast.",
@@ -314,6 +665,42 @@ CATALOG: list[Spec] = [
       REBUILD, expand="~/.android/avd/*"),
     S(TOOLCHAINS, "Flutter SDK cache", "~/.flutter", "Flutter engine artifacts.", "", REBUILD),
 
+    S(TOOLCHAINS, "Nix store", "/nix/store",
+      "Every package Nix has ever built or fetched, including old generations. "
+      "Only the ones no profile references can go.",
+      "nix-collect-garbage -d", REVIEW),
+    S(TOOLCHAINS, "Go SDKs", "~/sdk",
+      "Extra Go toolchains installed by `go install golang.org/dl/...`.",
+      "rm -rf ~/sdk/go<version>", REBUILD),
+    S(TOOLCHAINS, "nodenv versions", "~/.nodenv/versions",
+      "Node versions installed by nodenv.", "nodenv uninstall <version>", REBUILD),
+    S(TOOLCHAINS, "jenv versions", "~/.jenv/versions",
+      "JDKs registered with jenv.", "", REVIEW),
+    S(TOOLCHAINS, "tfenv versions", "~/.tfenv/versions",
+      "Terraform binaries installed by tfenv.", "tfenv uninstall <version>", REBUILD),
+    S(TOOLCHAINS, "Bun runtime", "~/.bun",
+      "The Bun binary, its install cache and anything bun added to PATH.",
+      "", REVIEW),
+    S(TOOLCHAINS, "PlatformIO", "~/.platformio",
+      "Embedded toolchains, frameworks and platform packages.",
+      "pio system prune", REBUILD),
+    S(TOOLCHAINS, "ESP-IDF tools", "~/.espressif",
+      "Xtensa and RISC-V toolchains for ESP32 development.", "", REBUILD),
+    S(TOOLCHAINS, "Unity editors", "~/Applications/Unity/Hub/Editor",
+      "Installed Unity editor versions. Several gigabytes each.",
+      "", REVIEW, expand="~/Applications/Unity/Hub/Editor/*", only="darwin"),
+    S(TOOLCHAINS, "Unity caches", "~/Library/Unity/cache",
+      "Unity's shared package, shader and asset import caches.", "", REBUILD),
+    S(TOOLCHAINS, "Unity Asset Store", "~/Library/Unity/Asset Store-5.x",
+      "Downloaded Asset Store packages. Re-downloadable from your account.",
+      "", REVIEW),
+    S(TOOLCHAINS, "Unreal derived data", "~/Library/Application Support/Epic",
+      "Epic launcher state and Unreal's derived data cache.", "", REBUILD),
+    S(TOOLCHAINS, "Godot data", "~/Library/Application Support/Godot",
+      "Godot export templates and per-project shader caches.", "", REBUILD),
+    S(TOOLCHAINS, "Emscripten cache", "~/.emscripten_cache",
+      "Compiled sysroot and ports for WebAssembly builds.",
+      "emcc --clear-cache"),
     # ------------------------------------------------------------ xcode / simulators
     S(APPLE, "Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData",
       "Build intermediates and indexes. The single safest big win on a Mac.",
@@ -345,15 +732,31 @@ CATALOG: list[Spec] = [
     S(APPLE, "Extra toolchains", "~/Library/Developer/Toolchains",
       "Swift development snapshots.", "", REVIEW),
 
+    S(APPLE, "tvOS DeviceSupport", "~/Library/Developer/Xcode/tvOS DeviceSupport",
+      "Symbols copied from every Apple TV you have debugged against.",
+      "rm -rf ~/Library/Developer/Xcode/'tvOS DeviceSupport'/*"),
+    S(APPLE, "macOS DeviceSupport", "~/Library/Developer/Xcode/macOS DeviceSupport",
+      "Symbols for macOS versions Xcode has debugged against.",
+      "rm -rf ~/Library/Developer/Xcode/'macOS DeviceSupport'/*"),
+    S(APPLE, "Xcode caches", "~/Library/Caches/com.apple.dt.Xcode",
+      "Xcode's own cache: indexes, module caches, downloaded documentation.",
+      "rm -rf ~/Library/Caches/com.apple.dt.Xcode"),
+    S(APPLE, "XCTest devices", "~/Library/Developer/XCTestDevices",
+      "Throwaway simulator clones left behind by test runs.",
+      "rm -rf ~/Library/Developer/XCTestDevices/*"),
+    S(APPLE, "Simulator volumes", "~/Library/Developer/CoreSimulator/Volumes",
+      "Mounted simulator runtime images.", "", REVIEW),
     # -------------------------------------------------------------- build & test
     S(BUILD, "Go build cache", "~/Library/Caches/go-build", "Compiled package objects.",
       "go clean -cache"),
     S(BUILD, "Turborepo cache", "~/.cache/turbo", "Shared Turborepo task cache.",
       "rm -rf ~/.cache/turbo"),
     S(BUILD, "Nx cache", "~/.cache/nx", "Nx computation cache.", "nx reset"),
+    # Only where Bazel puts it on macOS; on Linux the default output base lives
+    # under ~/.cache/bazel, which the shared entry above already covers.
     S(BUILD, "Bazel output", "/private/var/tmp/_bazel_" + os.environ.get("USER", "user"),
       "Bazel output bases. Frequently the largest thing on a Bazel machine.",
-      "bazel clean --expunge", REBUILD),
+      "bazel clean --expunge", REBUILD, only="darwin"),
     S(BUILD, "ccache", "~/.cache/ccache", "Compiler output cache.", "ccache -C"),
     S(BUILD, "ccache (Library)", "~/Library/Caches/ccache", "Compiler output cache.", "ccache -C"),
     S(BUILD, "sccache", "~/Library/Caches/Mozilla.sccache", "Shared compiler cache.",
@@ -381,6 +784,31 @@ CATALOG: list[Spec] = [
     S(BUILD, "other in ~/.cache", "~/.cache",
       "Everything in ~/.cache that is not itemised elsewhere here.", "", REVIEW),
 
+    S(BUILD, "node-gyp headers", "~/Library/Caches/node-gyp",
+      "Node headers and libraries kept for building native addons.",
+      "rm -rf ~/Library/Caches/node-gyp"),
+    S(BUILD, "electron-gyp headers", "~/.electron-gyp",
+      "Electron headers for building native addons against it.",
+      "rm -rf ~/.electron-gyp"),
+    S(BUILD, "Zig cache", "~/.cache/zig",
+      "Zig's global compilation cache.", "rm -rf ~/.cache/zig"),
+    S(BUILD, "Bazel disk cache", "~/.cache/bazel",
+      "Bazel's disk cache and repository downloads.",
+      "bazel clean --expunge", REBUILD),
+    S(BUILD, "Gradle daemon logs", "~/.gradle/daemon",
+      "Logs from every Gradle daemon that has ever started.",
+      "rm -rf ~/.gradle/daemon"),
+    S(BUILD, "TypeScript cache", "~/Library/Caches/typescript",
+      "Automatic type-acquisition downloads for editors.",
+      "rm -rf ~/Library/Caches/typescript"),
+    S(BUILD, "Selenium drivers", "~/.cache/selenium",
+      "Browser drivers downloaded by Selenium Manager.",
+      "rm -rf ~/.cache/selenium"),
+    S(BUILD, "Triton kernels", "~/.triton",
+      "GPU kernels Triton compiled. Rebuilt on demand, unlike the weights they run.",
+      "rm -rf ~/.triton"),
+    S(BUILD, "SwiftPM scratch", "~/.swiftpm",
+      "Swift Package Manager's shared cache and security state.", "", REBUILD),
     # ---------------------------------------------------------------- models/data
     S(MODELS, "Ollama models", "~/.ollama/models", "Local LLM weights. Tens of GB is normal.",
       "ollama list   # then: ollama rm <model>", REVIEW, expand="~/.ollama/models/blobs"),
@@ -391,6 +819,17 @@ CATALOG: list[Spec] = [
     S(MODELS, "LM Studio models", "~/.lmstudio/models", "GGUF weights.", "", REVIEW),
     S(MODELS, "Kaggle / datasets", "~/.cache/kagglehub", "Downloaded datasets.", "", REVIEW),
 
+    S(MODELS, "Whisper models", "~/.cache/whisper",
+      "Downloaded Whisper speech models.", "rm -rf ~/.cache/whisper", REBUILD),
+    S(MODELS, "Keras models", "~/.keras",
+      "Keras datasets and pretrained weights.", "", REBUILD),
+    S(MODELS, "Transformers cache", "~/.cache/transformers",
+      "The older Hugging Face cache layout, superseded by ~/.cache/huggingface.",
+      "rm -rf ~/.cache/transformers", REBUILD),
+    S(MODELS, "GPT4All models", "~/Library/Application Support/nomic.ai/GPT4All",
+      "Local model weights downloaded by GPT4All.", "", REVIEW),
+    S(MODELS, "llama.cpp models", "~/Library/Caches/llama.cpp",
+      "Model files pulled by llama.cpp tooling.", "", REVIEW),
     # ------------------------------------------------------------------ app caches
     S(APPS, "VS Code caches", "~/Library/Application Support/Code/Cache", "Renderer cache.",
       "rm -rf ~/Library/Application\\ Support/Code/Cache*"),
@@ -410,8 +849,131 @@ CATALOG: list[Spec] = [
       "rm -rf ~/Library/Logs/CoreSimulator"),
     S(APPS, "Developer diagnostics", "~/Library/Logs/DiagnosticReports", "Crash reports.",
       "rm -rf ~/Library/Logs/DiagnosticReports"),
+    S(APPS, "VS Code workspace state", "~/Library/Application Support/Code/User/workspaceStorage",
+      "Per-workspace editor state: indexes, histories, extension scratch. "
+      "Deleting it loses undo history and per-project layout, nothing else.",
+      "", REVIEW),
+    S(APPS, "VS Code updates", "~/Library/Caches/com.microsoft.VSCode.ShipIt",
+      "Downloaded VS Code updates that were never cleaned up.",
+      "rm -rf ~/Library/Caches/com.microsoft.VSCode.ShipIt"),
+    S(APPS, "VS Code extension VSIXs", "~/Library/Application Support/Code/CachedExtensionVSIXs",
+      "Extension archives kept after installing them.",
+      "rm -rf ~/Library/Application\\ Support/Code/CachedExtensionVSIXs"),
+    S(APPS, "Cursor extensions", "~/.cursor/extensions",
+      "Installed Cursor extensions.", "", REVIEW),
+    S(APPS, "Windsurf caches", "~/Library/Application Support/Windsurf/Cache",
+      "Windsurf's Electron cache.", "", REBUILD),
+    S(APPS, "Windsurf CachedData", "~/Library/Application Support/Windsurf/CachedData",
+      "Compiled JavaScript kept per Windsurf version.", "", REBUILD),
+    S(APPS, "JetBrains app state", "~/Library/Application Support/JetBrains",
+      "Plugins, indexes and per-IDE configuration. Configuration lives here too.",
+      "", REVIEW),
+    S(APPS, "Android Studio caches", "~/Library/Caches/Google",
+      "Android Studio indexes and build caches.", "", REBUILD),
+    S(APPS, "Zed state", "~/Library/Application Support/Zed",
+      "Zed's databases, logs and downloaded language servers.", "", REVIEW),
     S(APPS, "Claude CLI cache", "~/Library/Caches/claude-cli-nodejs", "Session scratch data.", ""),
 ]
+
+# --------------------------------------------------------------------------- #
+# the same tools, where Linux keeps them
+# --------------------------------------------------------------------------- #
+#
+# A Linux developer's disk fills with exactly the same things; only the layout
+# differs. These are merged into CATALOG below on Linux, and the ~/Library
+# entries above are dropped there.
+#
+# /var/lib/docker is deliberately absent. It is the real thing on Linux rather
+# than a VM disk, but measuring it needs root, and a number andy cannot read is
+# worse than no number. `docker system df` reports it without privileges, so on
+# Linux that breakdown is counted rather than shown as a duplicate view -- see
+# where the live rows are built in Scanner.run.
+
+LINUX_CATALOG: list[Spec] = [
+    S(PACKAGES, "pnpm store", "~/.local/share/pnpm/store",
+      "Content-addressed package store shared by every pnpm project.",
+      "pnpm store prune", only="linux"),
+    S(PACKAGES, "Yarn cache", "~/.cache/yarn",
+      "Yarn 1's global package cache.", "yarn cache clean", only="linux"),
+    S(PACKAGES, "Deno cache", "~/.cache/deno",
+      "Deno's fetched modules and compiled output.", "deno clean", only="linux"),
+    S(PACKAGES, "pip cache", "~/.cache/pip",
+      "Downloaded and built wheels.", "pip cache purge", only="linux"),
+    S(PACKAGES, "Poetry cache", "~/.cache/pypoetry",
+      "Poetry's artifact cache and its virtualenvs.", "poetry cache clear --all .",
+      REVIEW, only="linux"),
+    S(PACKAGES, "Coursier cache", "~/.cache/coursier",
+      "Scala and JVM dependencies fetched by Coursier / sbt.",
+      "cs cache --delete", REBUILD, only="linux"),
+    S(TOOLCHAINS, "fnm node versions", "~/.local/share/fnm/node-versions",
+      "Node versions installed by fnm.", "fnm uninstall <version>", REBUILD,
+      expand="~/.local/share/fnm/node-versions/*", only="linux"),
+    S(TOOLCHAINS, "Local JDKs", "~/.jdks",
+      "User-installed JDKs, usually put there by an IDE.", "", REVIEW,
+      expand="~/.jdks/*", only="linux"),
+    S(TOOLCHAINS, "Android SDK", "~/Android/Sdk",
+      "Platforms, build tools, NDKs and system images.", "", REVIEW,
+      expand="~/Android/Sdk/*", only="linux"),
+    S(TOOLCHAINS, "Unity editors", "~/Unity/Hub/Editor",
+      "Installed Unity editor versions. Several gigabytes each.", "", REVIEW,
+      expand="~/Unity/Hub/Editor/*", only="linux"),
+    S(TOOLCHAINS, "Flatpak apps", "~/.local/share/flatpak",
+      "Per-user Flatpak runtimes and applications.",
+      "flatpak uninstall --unused", REVIEW, only="linux"),
+    S(TOOLCHAINS, "snap packages", "~/snap",
+      "Per-user snap data and revisions.", "", REVIEW, only="linux"),
+    S(BUILD, "Go build cache", "~/.cache/go-build",
+      "Compiled package objects. Rebuilt on demand, and it grows forever.",
+      "go clean -cache", only="linux"),
+    S(BUILD, "Playwright browsers", "~/.cache/ms-playwright",
+      "Full browser builds, one per Playwright version.",
+      "npx playwright uninstall --all", REBUILD,
+      expand="~/.cache/ms-playwright/*", only="linux"),
+    S(BUILD, "Cypress binaries", "~/.cache/Cypress",
+      "One Cypress app bundle per version you have used.",
+      "cypress cache prune", REBUILD, expand="~/.cache/Cypress/*", only="linux"),
+    S(BUILD, "Electron binaries", "~/.cache/electron",
+      "Electron runtimes downloaded while building apps.",
+      "rm -rf ~/.cache/electron", REBUILD, only="linux"),
+    S(BUILD, "node-gyp headers", "~/.cache/node-gyp",
+      "Node headers and libraries kept for building native addons.",
+      "rm -rf ~/.cache/node-gyp", only="linux"),
+    S(BUILD, "TypeScript cache", "~/.cache/typescript",
+      "Automatic type-acquisition downloads for editors.",
+      "rm -rf ~/.cache/typescript", only="linux"),
+    S(BUILD, "Mesa shader cache", "~/.cache/mesa_shader_cache",
+      "Compiled GPU shaders. Regenerates itself.",
+      "rm -rf ~/.cache/mesa_shader_cache", only="linux"),
+    S(BUILD, "nvidia compute cache", "~/.nv/ComputeCache",
+      "Compiled CUDA kernels.", "rm -rf ~/.nv/ComputeCache", only="linux"),
+    S(MODELS, "GPT4All models", "~/.local/share/nomic.ai/GPT4All",
+      "Local model weights downloaded by GPT4All.", "", REVIEW, only="linux"),
+    S(APPS, "VS Code caches", "~/.config/Code/Cache",
+      "Electron's HTTP and code caches.", "rm -rf ~/.config/Code/Cache*", only="linux"),
+    S(APPS, "VS Code CachedData", "~/.config/Code/CachedData",
+      "Compiled JavaScript kept per VS Code version.",
+      "rm -rf ~/.config/Code/CachedData", only="linux"),
+    S(APPS, "VS Code workspace state", "~/.config/Code/User/workspaceStorage",
+      "Per-workspace editor state: indexes, histories, extension scratch.",
+      "", REVIEW, only="linux"),
+    S(APPS, "Cursor caches", "~/.config/Cursor/Cache",
+      "Electron caches for Cursor.", "rm -rf ~/.config/Cursor/Cache*", only="linux"),
+    S(APPS, "JetBrains caches", "~/.cache/JetBrains",
+      "Per-project indexes and compiler caches. Rebuilt on next open.",
+      "", REBUILD, only="linux"),
+    S(APPS, "JetBrains app state", "~/.local/share/JetBrains",
+      "Plugins and per-IDE configuration.", "", REVIEW, only="linux"),
+    S(APPS, "Zed cache", "~/.cache/zed",
+      "Zed's own cache.", "", only="linux"),
+    S(APPS, "Zed state", "~/.local/share/zed",
+      "Zed's databases, logs and downloaded language servers.", "", REVIEW,
+      only="linux"),
+    S(APPS, "Trash", "~/.local/share/Trash",
+      "Deleted files still occupying the disk.", "", REVIEW, only="linux"),
+]
+
+CATALOG = [s for s in CATALOG + LINUX_CATALOG if s.only in (None, PLATFORM)]
+
 
 # ----------------------------------------------------------------- project scan
 
@@ -445,6 +1007,29 @@ ARTIFACTS_STRICT = {
     ".eggs": "python eggs",
     ".cargo-target": "cargo",
     ".stack-work": "haskell",
+    ".output": "nitro output",
+    ".wrangler": "wrangler",
+    ".vercel": "vercel",
+    ".netlify": "netlify",
+    ".sst": "sst",
+    ".expo": "expo",
+    ".metro": "metro",
+    "storybook-static": "storybook",
+    ".rollup.cache": "rollup",
+    ".sass-cache": "sass",
+    ".ccls-cache": "ccls",
+    ".clangd": "clangd",
+    ".terragrunt-cache": "terragrunt",
+    ".cxx": "android ndk",
+    ".externalNativeBuild": "android ndk",
+    ".kotlin": "kotlin",
+    ".swiftpm": "swiftpm",
+    ".godot": "godot",
+    ".phpunit.cache": "phpunit",
+    "cmake-build-debug": "cmake",
+    "cmake-build-release": "cmake",
+    ".idea": "jetbrains (project)",
+    ".vs": "visual studio",
 }
 
 # Names that are only artifacts when a build marker sits beside them. The ones
@@ -459,14 +1044,28 @@ ARTIFACTS_AMBIGUOUS = {
     "dist": "dist",
     "out": "out",
     "vendor": "vendor",
+    ".cache": "cache (project)",
+    ".build": "swift build",
 }
 
-AMBIGUOUS_PRUNE = {"target", "obj", "deps", "_build", "coverage"}
+AMBIGUOUS_PRUNE = {"target", "obj", "deps", "_build", "coverage", ".cache", ".build"}
+
+# Most build output is a rebuild away. These are not: they hold editor state,
+# or somebody's vendored source, and a wrong `safe` here is the worst mistake
+# this program could make.
+ARTIFACT_SAFETY = {
+    "jetbrains (project)": REVIEW,
+    "visual studio": REVIEW,
+    "vendor": REVIEW,
+    "cache (project)": REVIEW,
+}
 
 MARKERS = (
-    "package.json", "Cargo.toml", "go.mod", "pyproject.toml", "setup.py",
+    "package.json", "Cargo.toml", "go.mod", "go.work", "pyproject.toml", "setup.py",
     "pom.xml", "build.gradle", "build.gradle.kts", "CMakeLists.txt", "Makefile",
     "mix.exs", "pubspec.yaml", "Gemfile", "composer.json", "build.sbt",
+    "Package.swift", "deno.json", "deno.jsonc", "stack.yaml", "rebar.config",
+    "meson.build", "WORKSPACE", "MODULE.bazel", "pnpm-workspace.yaml",
 )
 
 ROOT_CANDIDATES = [
@@ -628,7 +1227,8 @@ class Node:
     expanded: bool = False
     stale: bool = False             # size came from cache, not this scan
     informational: bool = False     # a view onto bytes counted elsewhere
-    blocked: bool = False           # du could not finish in time
+    blocked: bool = False           # the walk did not finish in the time it had
+    partial: bool = False           # `measured` is a floor, not the whole figure
     depth: int = 0
 
     @property
@@ -663,7 +1263,12 @@ class Model:
         for n in measured:
             n.inner = 0
         stack: list[Node] = []
-        for n in sorted(measured, key=lambda n: n.path):
+        # Order by path component, not by byte. Lexicographic order separates a
+        # directory from its own descendants whenever a sibling's next character
+        # sorts below os.sep -- ~/.cache-v2 falls between ~/.cache and
+        # ~/.cache/uv -- and the stack below would then attribute the child to
+        # nothing and count its bytes twice.
+        for n in sorted(measured, key=lambda n: n.path.split(os.sep)):
             while stack and not n.path.startswith(stack[-1].path + os.sep):
                 stack.pop()
             if stack:
@@ -742,12 +1347,13 @@ def save_cache(model: Model, found: list[tuple[str, str]]) -> None:
 
 class Scanner:
     def __init__(self, model: Model, roots: list[str], include_projects: bool = True,
-                 use_cache: bool = True, workers: int = 8) -> None:
+                 use_cache: bool = True, workers: int = 8, use_walker: bool = False) -> None:
         self.m = model
         self.roots = roots
         self.include_projects = include_projects
         self.use_cache = use_cache
         self.workers = workers
+        self.use_walker = use_walker
         self.cancel = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -778,65 +1384,65 @@ class Scanner:
         tasks = self._build_catalog(cached_sizes)
         with m.lock:
             m.phase = "measuring caches"
-            m.pending = len(tasks)
+            m.pending = len({n.path for n in tasks})
             m.recompute()
             m.generation += 1
 
-        pool = ThreadPoolExecutor(max_workers=self.workers)
-        try:
-            discovery = None
-            if self.include_projects and self.roots:
-                discovery = pool.submit(find_artifacts, self.roots)
-            docker = pool.submit(docker_breakdown)
+        discovery = None
+        if self.include_projects and self.roots:
+            discovery = Task(find_artifacts, self.roots)
+        docker = Task(docker_breakdown)
 
-            self._measure(pool, tasks)
+        self._measure(tasks)
 
-            # ---- phase 2: live docker detail, if a daemon answered
-            rows = []
-            try:
-                rows = docker.result(timeout=20)
-            except Exception:
-                rows = []
-            if rows:
-                with m.lock:
-                    parent = m.category(CONTAINERS)
-                    live = Node(
-                        label="docker · live breakdown",
-                        note="What the running daemon holds. These bytes sit inside the "
-                             "VM disk above, so they are not added to the total.",
-                        kind="docker", safety=REVIEW, informational=True,
-                    )
-                    for label, size, cmd, safety, note in rows:
-                        live.children.append(Node(
-                            label=label, measured=size, size=size, note=note,
-                            cmd=cmd, safety=safety, kind="docker", informational=True))
-                    parent.children.append(live)
-                    m.recompute()
-                    m.generation += 1
+        # ---- phase 2: live docker detail, if a daemon answered
+        rows = docker.result(timeout=20, default=[])
+        if rows:
+            # On macOS the daemon lives in a VM whose disk andy already measured,
+            # so these are the same bytes seen from inside and must not be added.
+            # On Linux there is no VM: /var/lib/docker is the real thing, it needs
+            # root to measure, and `docker system df` is the only figure available
+            # without privileges -- so there it counts.
+            duplicate = MACOS
+            with m.lock:
+                parent = m.category(CONTAINERS)
+                live = Node(
+                    label="docker · live breakdown" if duplicate else "docker",
+                    note=("What the running daemon holds. These bytes sit inside the "
+                          "VM disk above, so they are not added to the total."
+                          if duplicate else
+                          "What the daemon holds under /var/lib/docker, as it reports "
+                          "it. andy cannot read that directory without root, so this "
+                          "is the figure it uses."),
+                    kind="docker", safety=REVIEW, informational=duplicate,
+                )
+                for label, size, cmd, safety, note in rows:
+                    live.children.append(Node(
+                        label=label, measured=size, size=size, note=note,
+                        cmd=cmd, safety=safety, kind="docker",
+                        informational=duplicate))
+                parent.children.append(live)
+                m.recompute()
+                m.generation += 1
 
-            # ---- phase 3: per-project artifacts
-            found: list[tuple[str, str]] = []
-            if discovery is not None:
-                with m.lock:
-                    m.phase = "finding project artifacts"
-                try:
-                    found = discovery.result(timeout=900)
-                except Exception:
-                    found = []
-            elif self.include_projects and cached.get("found"):
-                # roots were given but discovery did not run; fall back to cache
-                found = [tuple(x) for x in cached["found"]]
+        # ---- phase 3: per-project artifacts
+        found: list[tuple[str, str]] = []
+        if discovery is not None:
+            with m.lock:
+                m.phase = "finding project artifacts"
+            found = discovery.result(timeout=900, default=[])
+        elif self.include_projects and cached.get("found"):
+            # roots were given but discovery did not run; fall back to cache
+            found = [tuple(x) for x in cached["found"]]
 
-            if found:
-                tasks2 = self._build_projects(found, cached_sizes)
-                with m.lock:
-                    m.phase = f"measuring {len(tasks2)} project directories"
-                    m.pending += len(tasks2)
-                    m.recompute()
-                    m.generation += 1
-                self._measure(pool, tasks2)
-        finally:
-            pool.shutdown(wait=False)
+        if found:
+            tasks2 = self._build_projects(found, cached_sizes)
+            with m.lock:
+                m.phase = f"measuring {len(tasks2)} project directories"
+                m.pending += len({n.path for n in tasks2})
+                m.recompute()
+                m.generation += 1
+            self._measure(tasks2)
 
         with m.lock:
             for n in m.walk():
@@ -906,7 +1512,8 @@ class Scanner:
                     if group is None:
                         group = Node(label=kind, kind=kind,
                                      note=ARTIFACT_NOTES.get(kind, "Regenerated by your build."),
-                                     cmd=ARTIFACT_CMDS.get(kind, ""), safety=REBUILD)
+                                     cmd=ARTIFACT_CMDS.get(kind, ""),
+                                     safety=ARTIFACT_SAFETY.get(kind, REBUILD))
                         groups[kind] = group
                         projects.children.append(group)
                     node = Node(
@@ -920,65 +1527,55 @@ class Scanner:
                 tasks.append(node)
         return tasks
 
-    def _measure(self, pool: ThreadPoolExecutor, tasks: list[Node]) -> None:
-        """du the given nodes in parallel batches, publishing results as they land."""
+    def _measure(self, tasks: list[Node]) -> None:
+        """Measure the given nodes, publishing sizes as they climb."""
         m = self.m
         by_path: dict[str, list[Node]] = {}
         for n in tasks:
             by_path.setdefault(n.path, []).append(n)
-        paths = list(by_path)
-        # small batches keep the UI moving; large ones keep du efficient
-        batch = max(8, min(96, len(paths) // (self.workers * 3) or 8))
-        chunks = [paths[i:i + batch] for i in range(0, len(paths), batch)]
-        cap = min(180.0, 20.0 + 3.0 * batch)
-        futures = {pool.submit(du_batch, c, cap): c for c in chunks}
-        stragglers: list[str] = []
-        for fut in as_completed(futures):
-            if self.cancel.is_set():
-                return
-            try:
-                sizes = fut.result()
-            except Exception:
-                sizes = {}
-            chunk = futures[fut]
+        if not by_path:
+            return
+
+        def publish(updates: list[tuple[str, int, str]]) -> None:
             with m.lock:
-                for path in chunk:
-                    got = sizes.get(path)
-                    if got is None:
-                        stragglers.append(path)
-                        continue
+                for path, size, status in updates:
                     for node in by_path.get(path, ()):
-                        node.measured = got
-                        node.stale = False
-                        node.blocked = False
-                    m.done += 1
+                        self._apply(node, size, status)
+                    if status != "running":
+                        m.done += 1
                 m.recompute()
 
-        # anything the batch could not finish gets one more try on its own, so a
-        # single pathological directory does not cost its neighbours their sizes
-        if stragglers and not self.cancel.is_set():
-            with m.lock:
-                m.phase = f"retrying {len(stragglers)} slow {'path' if len(stragglers) == 1 else 'paths'}"
-            retries = {pool.submit(du_batch, [path], 25.0): path for path in stragglers}
-            for fut in as_completed(retries):
-                path = retries[fut]
-                try:
-                    sizes = fut.result()
-                except Exception:
-                    sizes = {}
-                got = sizes.get(path)
-                with m.lock:
-                    for node in by_path.get(path, ()):
-                        if got is None:
-                            # keep a cached figure if we have one; flag it either way
-                            node.blocked = True
-                            node.stale = node.measured is not None
-                        else:
-                            node.measured = got
-                            node.stale = False
-                            node.blocked = False
-                    m.done += 1
-                    m.recompute()
+        engine = Walker if self.use_walker else DuMeasurer
+        engine(self.workers, self.cancel).run(list(by_path), publish)
+
+    @staticmethod
+    def _apply(node: Node, size: int, status: str) -> None:
+        """Fold one measurement into a node.
+
+        A scan opens showing the previous run's figures, so a climbing partial
+        must not be allowed to drag a cached 28G down to the 4K of the root
+        directory and back up again. While a figure is still stale it is only
+        replaced once the floor has overtaken it; after that every update is
+        this scan's own and simply applies."""
+        if status == "running":
+            if not node.stale or size >= (node.measured or 0):
+                node.measured = size
+                node.stale = False
+                node.partial = True
+                node.blocked = False
+        elif status == "done":
+            node.measured = size
+            node.stale = node.partial = node.blocked = False
+        else:                       # the budget expired: what was counted is a floor
+            node.blocked = True
+            if size <= 0 and node.measured is None:
+                node.partial = False    # nothing counted at all, so nothing to claim
+            elif node.stale and (node.measured or 0) > size:
+                node.partial = False    # last scan's complete figure is still plausible
+            else:
+                node.measured = size
+                node.stale = False
+                node.partial = True
 
 
 ARTIFACT_NOTES = {
@@ -989,6 +1586,17 @@ ARTIFACT_NOTES = {
     "cocoapods": "Installed pods; `pod install` restores them.",
     "deriveddata": "Xcode build intermediates inside the project.",
     "terraform": "Provider plugins, re-downloaded by `terraform init`.",
+    "jetbrains (project)": "IDE indexes, and the run configurations beside them. "
+                           "Rebuilt on next open, but read it before you delete it.",
+    "visual studio": "Visual Studio's per-solution state and indexes.",
+    "vendor": "Vendored dependencies. Usually restorable, sometimes the only copy.",
+    "cache (project)": "A project-local cache. Contents depend on the tool that made it.",
+    "swift build": "Swift Package Manager build output. `swift package clean` removes it.",
+    "android ndk": "Native build intermediates from the Android NDK.",
+    "storybook": "A built Storybook. `npm run build-storybook` makes it again.",
+    "cmake": "A CMake build tree, usually made by CLion.",
+    "godot": "Godot's per-project import and shader cache.",
+    "swiftpm": "Swift Package Manager's per-project scratch state.",
 }
 
 ARTIFACT_CMDS = {
@@ -999,6 +1607,11 @@ ARTIFACT_CMDS = {
     "next.js": "rm -rf <project>/.next",
     "cocoapods": "rm -rf <project>/Pods   # then: pod install",
     "deriveddata": "rm -rf <project>/DerivedData",
+    "swift build": "swift package clean   # run inside the project",
+    "cmake": "rm -rf <project>/cmake-build-*",
+    "storybook": "rm -rf <project>/storybook-static",
+    "jetbrains (project)": "",   # no command: read it before removing it
+    "vendor": "",
 }
 
 
@@ -1122,13 +1735,22 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     blocked = [n for n in m.walk() if n.blocked]
     if blocked:
         p()
-        p(f" {ink.red('not measured')}  "
-          f"{ink.dim('du could not finish in time on ' + str(len(blocked)) + ' of them')}")
+        p(f" {ink.yellow('still counting when time ran out')}  "
+          f"{ink.dim(str(len(blocked)) + (' location' if len(blocked) == 1 else ' locations'))}")
         for n in blocked[:4]:
-            known = f" (last scan: {human(n.size)})" if n.measured else ""
+            if n.partial:
+                known = f" (at least {human(n.size)} so far)"
+            elif n.measured:
+                known = f" (last scan: {human(n.size)})"
+            else:
+                known = " (nothing counted)"
             p(f"   {ink.dim('·')} {n.label}{ink.dim(known)}")
-        p(f"   {ink.dim('a running container VM or a network mount will block du; '
-                        'stop it, or point andy at that path alone')}")
+        # Built outside the f-string: an expression may not span lines inside one
+        # until Python 3.12, and andy supports 3.9.
+        why = ("these are floors, not totals. A running container VM or a network "
+               "mount blocks on I/O for minutes; stop it, or point andy at that "
+               "path alone")
+        p(f"   {ink.dim(why)}")
 
     p()
     p(f" {ink.dim('andy -i')} to browse   "
@@ -1190,7 +1812,9 @@ def to_json(m: Model) -> dict:
         if n.informational:
             d["informational"] = True
         if n.blocked:
-            d["measured"] = False
+            # `bytes` is a floor rather than a total: the walk did not finish
+            d["complete"] = False
+            d["measured"] = bool(n.partial)
         if n.path:
             d["path"] = n.path
         if n.kind:
@@ -1203,8 +1827,11 @@ def to_json(m: Model) -> dict:
         return d
 
     total, used, free = m.disk
+    looked_at = sum(1 for s in CATALOG) + len(m.roots)
     return {
         "version": VERSION,
+        "platform": PLATFORM,
+        "locations_known": looked_at,
         "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "duration_seconds": round(m.elapsed, 2),
         "volume": {"total_bytes": total, "used_bytes": used, "free_bytes": free},
@@ -1240,6 +1867,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--no-projects", action="store_true",
                     help="skip the per-project artifact scan (much faster)")
     ap.add_argument("--fresh", action="store_true", help="ignore the cached sizes")
+    ap.add_argument("--walk", action="store_true", dest="use_walker",
+                    help="measure in process instead of running du(1) "
+                         "(slower, but spawns nothing)")
     ap.add_argument("--no-color", action="store_true", help="disable colour")
     ap.add_argument("--no-mouse", action="store_true",
                     help="disable mouse reporting in -i, so the terminal keeps "
@@ -1270,7 +1900,8 @@ def main(argv: list[str] | None = None) -> int:
     model.roots = roots
     scanner = Scanner(model, roots,
                       include_projects=not args.no_projects,
-                      use_cache=not args.fresh)
+                      use_cache=not args.fresh,
+                      use_walker=args.use_walker)
 
     if args.tui:
         from_tty = sys.stdout.isatty() and sys.stdin.isatty()
@@ -1440,7 +2071,7 @@ HELP = [
     ("using", [
         ("c", "copy the command"),
         ("y", "copy the path"),
-        ("o", "reveal in Finder"),
+        ("o", f"reveal in {FILE_MANAGER}"),
         ("d", "the detail pane"),
         ("r", "rescan"),
         ("q", "quit"),
@@ -1453,7 +2084,7 @@ HELP = [
     ("the mouse", [
         ("click", "select a row or cell"),
         ("click ▸", "open or close a branch"),
-        ("double click", "open, or reveal in Finder"),
+        ("double click", f"open, or reveal in {FILE_MANAGER}"),
         ("right click", "copy the command"),
         ("wheel", "scroll the list"),
         ("left edge", "the scroll bar"),
@@ -1461,8 +2092,8 @@ HELP = [
     ]),
 ]
 
-BLOCKED_HINT = ("du could not finish here in time; a running container VM or a "
-                "network mount does that.")
+BLOCKED_HINT = ("the walk ran out of time here; a running container VM or a "
+                "network mount blocks on I/O for minutes at a stretch.")
 
 SAFETY_TEXT = {
     SAFE: "safe — regenerates itself",
@@ -1570,6 +2201,13 @@ class Tui:
         if n >= 100 * 2 ** 20:
             return curses.A_NORMAL
         return self.DIM
+
+    @staticmethod
+    def size_text(node: Node) -> str:
+        """Six columns: the size, with a leading sign when it is only a floor."""
+        if node.blocked and node.measured is None:
+            return "     ?"
+        return ("≥" if node.partial else " ") + human(node.size, pad=True)
 
     def note(self, text: str, seconds: float = 2.0) -> None:
         self.message = text
@@ -1747,7 +2385,7 @@ class Tui:
                 if pathw and node.path:
                     self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw),
                              curses.A_REVERSE)
-                self.put(y, w - sizew - bw - 2, human(node.size, pad=True), curses.A_REVERSE)
+                self.put(y, w - sizew - bw - 2, self.size_text(node), curses.A_REVERSE)
                 self.put(y, w - bw - 1, bar(frac, bw), curses.A_REVERSE)
                 continue
 
@@ -1757,10 +2395,8 @@ class Tui:
             self.put(y, 1, text, attr)
             if pathw and node.path:
                 self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw), self.DIM)
-            size_text = "    ?" if (node.blocked and node.measured is None) \
-                else human(node.size, pad=True)
-            self.put(y, w - sizew - bw - 2, size_text,
-                     self.RED if node.blocked else self.magnitude(node.size))
+            self.put(y, w - sizew - bw - 2, self.size_text(node),
+                     self.YELLOW if node.blocked else self.magnitude(node.size))
             self.put(y, w - bw - 1, bar(frac, bw),
                      self.ACCENT if depth == 0 else self.DIM)
 
@@ -1859,8 +2495,13 @@ class Tui:
 
         note = node.note
         if node.blocked:
-            note = ("not measured — " + BLOCKED_HINT
-                    + (" Showing the previous scan's figure." if node.measured else ""))
+            if node.partial:
+                extra = f" Counted {human(node.size)} before giving up, so it is at least that."
+            elif node.measured:
+                extra = " Showing the previous scan's figure."
+            else:
+                extra = " Nothing was counted."
+            note = "incomplete — " + BLOCKED_HINT + extra
         if note:
             self.put(y0 + 3, 1, shorten(note, w - 3),
                      self.RED if node.blocked else 0)
@@ -2015,12 +2656,18 @@ class Tui:
         if not node.path:
             self.note("no path for this item")
             return
+        # `open -R` selects the item; xdg-open has no equivalent, so Linux gets
+        # the containing directory opened instead.
+        argv = (["open", "-R", node.path] if MACOS
+                else ["xdg-open", os.path.dirname(node.path) or node.path])
+        if not shutil.which(argv[0]):
+            self.note(f"no {argv[0]} on this system")
+            return
         try:
-            subprocess.Popen(["open", "-R", node.path],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.note("revealed in Finder")
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.note(f"opened in {FILE_MANAGER}")
         except Exception:
-            self.note("could not open Finder")
+            self.note(f"could not open {FILE_MANAGER}")
 
     def copy_cmd(self, node: Node) -> None:
         if node.cmd:
@@ -2288,7 +2935,7 @@ class Tui:
             self.m.disk = shutil.disk_usage(HOME)
         self.scanner = Scanner(self.m, self.m.roots,
                                include_projects=self.scanner.include_projects,
-                               use_cache=False)
+                               use_cache=False, use_walker=self.scanner.use_walker)
         self.scanner.start()
         self.restore = expanded
         self.note("rescanning")
