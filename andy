@@ -55,6 +55,16 @@ def tilde(path: str) -> str:
     return "~" + path[len(HOME):] if path.startswith(HOME + os.sep) else path
 
 
+def clip_end(text: str, width: int) -> str:
+    """Trim from the right. For a narrow treemap cell the leading words are the
+    identifying ones, so middle-elision would throw away the wrong half."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    return text[:width - 1] + "…" if width > 1 else text[:1]
+
+
 def shorten(text: str, width: int) -> str:
     """Trim to width, eliding the middle of long paths."""
     if width <= 0:
@@ -94,25 +104,39 @@ def clip(text: str) -> bool:
         return False
 
 
-def du_batch(paths: list[str]) -> dict[str, int]:
-    """Measure several paths with one du(1). Returns bytes keyed by path."""
+def _parse_du(text: str) -> dict[str, int]:
     sizes: dict[str, int] = {}
-    if not paths:
-        return sizes
-    try:
-        p = subprocess.run(
-            ["du", "-sk", *paths],
-            capture_output=True, text=True, timeout=900,
-        )
-    except Exception:
-        return sizes
-    for line in p.stdout.splitlines():
+    for line in text.splitlines():
         kb, _, path = line.partition("\t")
         try:
             sizes[path] = int(kb.strip()) * 1024
         except ValueError:
             continue
     return sizes
+
+
+def du_batch(paths: list[str], timeout: float = 60.0) -> dict[str, int]:
+    """Measure several paths with one du(1). Returns bytes keyed by path.
+
+    `-x` keeps du on one filesystem, so it never wanders into a network share or
+    a VM mount and reports space that is not on this disk. The timeout matters
+    more than it looks: du on the data directory of a *running* container VM can
+    block on I/O for many minutes at no CPU at all, and without a cap that single
+    directory would stall the whole scan. du prints a line per path as it
+    finishes, so whatever completed before the cap is still salvaged."""
+    if not paths:
+        return {}
+    try:
+        p = subprocess.run(["du", "-skx", *paths],
+                           capture_output=True, text=True, timeout=timeout)
+        return _parse_du(p.stdout)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return _parse_du(out)
+    except Exception:
+        return {}
 
 
 def usable_dir(path: str) -> bool:
@@ -604,6 +628,7 @@ class Node:
     expanded: bool = False
     stale: bool = False             # size came from cache, not this scan
     informational: bool = False     # a view onto bytes counted elsewhere
+    blocked: bool = False           # du could not finish in time
     depth: int = 0
 
     @property
@@ -798,7 +823,8 @@ class Scanner:
                     found = discovery.result(timeout=900)
                 except Exception:
                     found = []
-            elif cached.get("found"):
+            elif self.include_projects and cached.get("found"):
+                # roots were given but discovery did not run; fall back to cache
                 found = [tuple(x) for x in cached["found"]]
 
             if found:
@@ -814,7 +840,8 @@ class Scanner:
 
         with m.lock:
             for n in m.walk():
-                n.stale = False
+                if not n.blocked:
+                    n.stale = False
             m.recompute()
             m.finished = True
             m.elapsed = time.time() - m.started
@@ -903,7 +930,9 @@ class Scanner:
         # small batches keep the UI moving; large ones keep du efficient
         batch = max(8, min(96, len(paths) // (self.workers * 3) or 8))
         chunks = [paths[i:i + batch] for i in range(0, len(paths), batch)]
-        futures = {pool.submit(du_batch, c): c for c in chunks}
+        cap = min(180.0, 20.0 + 3.0 * batch)
+        futures = {pool.submit(du_batch, c, cap): c for c in chunks}
+        stragglers: list[str] = []
         for fut in as_completed(futures):
             if self.cancel.is_set():
                 return
@@ -913,13 +942,43 @@ class Scanner:
                 sizes = {}
             chunk = futures[fut]
             with m.lock:
-                for p in chunk:
-                    got = sizes.get(p)
-                    for node in by_path.get(p, ()):
-                        node.measured = got if got is not None else (node.measured or 0)
+                for path in chunk:
+                    got = sizes.get(path)
+                    if got is None:
+                        stragglers.append(path)
+                        continue
+                    for node in by_path.get(path, ()):
+                        node.measured = got
                         node.stale = False
+                        node.blocked = False
                     m.done += 1
                 m.recompute()
+
+        # anything the batch could not finish gets one more try on its own, so a
+        # single pathological directory does not cost its neighbours their sizes
+        if stragglers and not self.cancel.is_set():
+            with m.lock:
+                m.phase = f"retrying {len(stragglers)} slow {'path' if len(stragglers) == 1 else 'paths'}"
+            retries = {pool.submit(du_batch, [path], 25.0): path for path in stragglers}
+            for fut in as_completed(retries):
+                path = retries[fut]
+                try:
+                    sizes = fut.result()
+                except Exception:
+                    sizes = {}
+                got = sizes.get(path)
+                with m.lock:
+                    for node in by_path.get(path, ()):
+                        if got is None:
+                            # keep a cached figure if we have one; flag it either way
+                            node.blocked = True
+                            node.stale = node.measured is not None
+                        else:
+                            node.measured = got
+                            node.stale = False
+                            node.blocked = False
+                    m.done += 1
+                    m.recompute()
 
 
 ARTIFACT_NOTES = {
@@ -1060,6 +1119,17 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
             p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
               f"{shorten(n.label, namew).ljust(namew)}  {ink.dim(shorten(path, room))}")
 
+    blocked = [n for n in m.walk() if n.blocked]
+    if blocked:
+        p()
+        p(f" {ink.red('not measured')}  "
+          f"{ink.dim('du could not finish in time on ' + str(len(blocked)) + ' of them')}")
+        for n in blocked[:4]:
+            known = f" (last scan: {human(n.size)})" if n.measured else ""
+            p(f"   {ink.dim('·')} {n.label}{ink.dim(known)}")
+        p(f"   {ink.dim('a running container VM or a network mount will block du; '
+                        'stop it, or point andy at that path alone')}")
+
     p()
     p(f" {ink.dim('andy -i')} to browse   "
       f"{ink.dim('andy --commands')} to print reclaim commands   "
@@ -1119,6 +1189,8 @@ def to_json(m: Model) -> dict:
         d = {"label": n.label, "bytes": n.size}
         if n.informational:
             d["informational"] = True
+        if n.blocked:
+            d["measured"] = False
         if n.path:
             d["path"] = n.path
         if n.kind:
@@ -1169,6 +1241,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                     help="skip the per-project artifact scan (much faster)")
     ap.add_argument("--fresh", action="store_true", help="ignore the cached sizes")
     ap.add_argument("--no-color", action="store_true", help="disable colour")
+    ap.add_argument("--no-mouse", action="store_true",
+                    help="disable mouse reporting in -i, so the terminal keeps "
+                         "its own click-and-drag text selection")
     ap.add_argument("-V", "--version", action="version", version=f"andy {VERSION}")
     return ap.parse_args(argv)
 
@@ -1203,7 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
             print("andy: -i needs a terminal", file=sys.stderr)
             return 2
         scanner.start()
-        run_tui(model, scanner)
+        run_tui(model, scanner, use_mouse=not args.no_mouse)
         return 0
 
     colour = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
@@ -1245,17 +1320,116 @@ def main(argv: list[str] | None = None) -> int:
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+# A sequential ramp of xterm-256 greys, darkest first, each paired with the label
+# colour that gives it the better contrast (worst case 4.54:1, so every label
+# clears AA). Area already carries magnitude here, so colour's job is only to
+# separate neighbouring cells -- which greys do identically on a light or a dark
+# terminal, since each cell supplies its own surface.
+MAP_RAMP = ((239, 231), (241, 231), (243, 16), (245, 16), (247, 16), (249, 16))
+
+
+def _worst_aspect(row: list[float], side: float) -> float:
+    total = sum(row)
+    if total <= 0 or side <= 0:
+        return float("inf")
+    s2, side2 = total * total, side * side
+    return max(side2 * max(row) / s2, s2 / (side2 * min(row)))
+
+
+def squarify(values: list[float], x: float, y: float, dx: float, dy: float):
+    """Squarified treemap (Bruls, Huizing & van Wijk). `values` must be sorted
+    descending and scaled so that their sum equals dx * dy. Returns one
+    (x, y, w, h) per value, in the same order."""
+    rects: list[tuple[float, float, float, float]] = []
+    vals = list(values)
+    while vals:
+        if len(vals) == 1:
+            rects.append((x, y, dx, dy))
+            break
+        side = min(dx, dy)
+        if side <= 0:
+            rects.extend((x, y, 0.0, 0.0) for _ in vals)
+            break
+        # grow a row for as long as its worst aspect ratio keeps improving
+        row, i = [vals[0]], 1
+        current = _worst_aspect(row, side)
+        while i < len(vals):
+            nxt = _worst_aspect(row + [vals[i]], side)
+            if nxt > current:
+                break
+            row.append(vals[i])
+            current = nxt
+            i += 1
+        total = sum(row)
+        if dx >= dy:
+            width = total / dy if dy else 0.0
+            yy = y
+            for v in row:
+                height = dy * v / total if total else 0.0
+                rects.append((x, yy, width, height))
+                yy += height
+            x += width
+            dx -= width
+        else:
+            height = total / dx if dx else 0.0
+            xx = x
+            for v in row:
+                width = dx * v / total if total else 0.0
+                rects.append((xx, y, width, height))
+                xx += width
+            y += height
+            dy -= height
+        vals = vals[i:]
+    return rects
+
+
+def map_cells(nodes: list[Node], x0: int, y0: int, width: int, height: int):
+    """Lay real nodes out over a character grid, largest first.
+
+    Returns (cells, skipped). A category only earns a cell if that cell comes out
+    big enough to label; the ones too small at this size are reported separately
+    rather than folded together, so a large category never disappears just
+    because a tiny one could not fit."""
+    area = width * height
+    live = [n for n in nodes if n.size > 0 and not n.informational]
+    if not live or area <= 0:
+        return [], []
+    live.sort(key=lambda n: -n.size)
+
+    def attempt(keep: list[Node]):
+        total = sum(n.size for n in keep)
+        if total <= 0:
+            return []
+        scaled = [n.size / total * area for n in keep]
+        out = []
+        for node, (rx, ry, rw, rh) in zip(
+                keep, squarify(scaled, 0.0, 0.0, float(width), float(height))):
+            ix, iy = int(round(rx)), int(round(ry))
+            iw = max(0, int(round(rx + rw)) - ix)
+            ih = max(0, int(round(ry + rh)) - iy)
+            out.append((node, x0 + ix, y0 + iy, iw, ih))
+        return out
+
+    for count in range(len(live), 0, -1):
+        cells = attempt(live[:count])
+        if not cells:
+            continue
+        if count == 1 or all(w >= 5 and h >= 2 for _, _, _, w, h in cells):
+            return cells, live[count:]
+    return [], live
+
+
 HELP = [
     ("moving", [
         ("j / ↓", "down"),
         ("k / ↑", "up"),
-        ("ctrl-d / ctrl-u", "half page"),
+        ("ctrl-d / ctrl-u", "half a page"),
         ("g / G", "first / last"),
     ]),
     ("opening", [
         ("↵  space  tab", "expand or collapse"),
         ("→ / ←", "expand / collapse"),
-        ("e / E", "expand all / collapse all"),
+        ("e / E", "expand / collapse all"),
     ]),
     ("finding", [
         ("/", "filter by name or path"),
@@ -1264,14 +1438,31 @@ HELP = [
         ("a", "show items under 10M"),
     ]),
     ("using", [
-        ("c", "copy the reclaim command"),
+        ("c", "copy the command"),
         ("y", "copy the path"),
         ("o", "reveal in Finder"),
-        ("d", "toggle the detail pane"),
+        ("d", "the detail pane"),
         ("r", "rescan"),
         ("q", "quit"),
     ]),
+    ("the area map", [
+        ("m", "sizes as areas, or back"),
+        ("↵", "open the highlighted one"),
+        ("←  backspace", "up a level"),
+    ]),
+    ("the mouse", [
+        ("click", "select a row or cell"),
+        ("click ▸", "open or close a branch"),
+        ("double click", "open, or reveal in Finder"),
+        ("right click", "copy the command"),
+        ("wheel", "scroll the list"),
+        ("left edge", "the scroll bar"),
+        ("shift-drag", "native text selection"),
+    ]),
 ]
+
+BLOCKED_HINT = ("du could not finish here in time; a running container VM or a "
+                "network mount does that.")
 
 SAFETY_TEXT = {
     SAFE: "safe — regenerates itself",
@@ -1283,7 +1474,8 @@ SAFETY_TEXT = {
 class Tui:
     MIN_SMALL = 10 * 2 ** 20     # hidden unless 'a'
 
-    def __init__(self, stdscr, model: Model, scanner: Scanner) -> None:
+    def __init__(self, stdscr, model: Model, scanner: Scanner,
+                 use_mouse: bool = True) -> None:
         self.s = stdscr
         self.m = model
         self.scanner = scanner
@@ -1300,13 +1492,34 @@ class Tui:
         self.message = ""
         self.message_until = 0.0
         self.tick = 0
+        self.use_mouse = use_mouse
+        self.view = "tree"
+        self.map_stack: list[Node] = []
+        self.map_cells: list[tuple[Node, int, int, int, int]] = []
+        self.map_sel = 0
+        self.zones: list[tuple[int, int, int, str, object]] = []
+        self.last_click = (0.0, -1)
 
     # -- curses plumbing ----------------------------------------------------- #
+
+    # ncurses built with mouse version 1 has no BUTTON5, and misreports a
+    # wheel-down as a position report. It only ever enables xterm mode 1000,
+    # which never sends motion, so that bit is unambiguous here.
+    WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", curses.REPORT_MOUSE_POSITION)
+    CLICK = (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)
+    RIGHT_CLICK = (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED)
 
     def setup(self) -> None:
         curses.curs_set(0)
         self.s.nodelay(True)
         self.s.keypad(True)
+        if self.use_mouse:
+            try:
+                curses.mousemask(curses.ALL_MOUSE_EVENTS
+                                 | curses.REPORT_MOUSE_POSITION)
+                curses.mouseinterval(0)      # report presses at once, no lag
+            except Exception:
+                self.use_mouse = False
         self.colour = False
         try:
             curses.start_color()
@@ -1314,9 +1527,15 @@ class Tui:
             for i, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_RED,
                                     curses.COLOR_YELLOW, curses.COLOR_GREEN), start=1):
                 curses.init_pair(i, fg, -1)
+            self.map_pairs = []
+            if curses.COLORS >= 256:
+                for k, (bg, fg) in enumerate(MAP_RAMP):
+                    curses.init_pair(10 + k, fg, bg)
+                    self.map_pairs.append(curses.color_pair(10 + k))
             self.colour = True
         except Exception:
             self.colour = False
+            self.map_pairs = []
         self.ACCENT = curses.color_pair(1) if self.colour else curses.A_BOLD
         self.RED = curses.color_pair(2) if self.colour else curses.A_NORMAL
         self.YELLOW = curses.color_pair(3) if self.colour else curses.A_NORMAL
@@ -1331,6 +1550,17 @@ class Tui:
             self.s.addnstr(y, x, text, max(0, w - x - 1), attr)
         except curses.error:
             pass
+
+    def zone(self, y: int, x0: int, x1: int, kind: str, payload=None) -> None:
+        """Register a clickable span. Later registrations win, so narrow
+        targets are added after the wide ones they sit on top of."""
+        self.zones.append((y, x0, x1, kind, payload))
+
+    def zone_at(self, y: int, x: int):
+        for zy, x0, x1, kind, payload in reversed(self.zones):
+            if zy == y and x0 <= x <= x1:
+                return kind, payload
+        return None, None
 
     def magnitude(self, n: int) -> int:
         if n >= 10 * 2 ** 30:
@@ -1406,6 +1636,7 @@ class Tui:
 
     def draw(self) -> None:
         self.s.erase()
+        self.zones = []
         h, w, head, body, detail, foot = self.geometry()
         with self.m.lock:
             if self.restore:
@@ -1416,7 +1647,10 @@ class Tui:
                     self.restore = set()
             self.build_rows()
             self.draw_header(w)
-            self.draw_body(head, body, w)
+            if self.view == "map":
+                self.draw_map(head, body, w)
+            else:
+                self.draw_body(head, body, w)
             if detail:
                 self.draw_detail(head + body, detail, w)
         self.draw_footer(h - 1, w)
@@ -1429,6 +1663,7 @@ class Tui:
         m = self.m
         total, used, free = m.disk
         pct = used / total if total else 0.0
+        self.put(0, 0, " " * (w - 1))
         self.put(0, 1, "andy", curses.A_BOLD)
         if m.finished:
             right = f"{m.count} locations · {m.elapsed:.1f}s"
@@ -1499,6 +1734,11 @@ class Tui:
             label = node.label if depth else node.label.upper()
             text = shorten(indent + glyph + label, labelw)
 
+            self.zone(y, 0, w - 1, "row", idx)
+            if node.children:
+                gx = 1 + len(indent)
+                self.zone(y, gx, gx + 1, "toggle", idx)
+
             frac = node.size / peak if peak else 0.0
 
             if selected:
@@ -1517,10 +1757,75 @@ class Tui:
             self.put(y, 1, text, attr)
             if pathw and node.path:
                 self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw), self.DIM)
-            self.put(y, w - sizew - bw - 2, human(node.size, pad=True),
-                     self.magnitude(node.size))
+            size_text = "    ?" if (node.blocked and node.measured is None) \
+                else human(node.size, pad=True)
+            self.put(y, w - sizew - bw - 2, size_text,
+                     self.RED if node.blocked else self.magnitude(node.size))
             self.put(y, w - bw - 1, bar(frac, bw),
                      self.ACCENT if depth == 0 else self.DIM)
+
+        self.draw_scrollbar(y0, body, w)
+
+    def draw_map(self, y0: int, body: int, w: int) -> None:
+        level = self.map_level()
+        self.put(y0, 0, " " * (w - 1))
+        trail = " › ".join(n.label for n in self.map_stack) or "all categories"
+        total = sum(n.size for n in level if not n.informational)
+        head = f"{trail}" + ("   ← back" if self.map_stack else "")
+        self.put(y0, 1, shorten(head, w - 16), curses.A_BOLD)
+        shown = len([n for n in level if n.size > 0 and not n.informational])
+        right = f"{human(total)} in {shown}"
+        self.put(y0, max(20, w - len(right) - 2), right, self.DIM)
+        if self.map_stack:
+            self.zone(y0, 1, w - 2, "mapup")
+
+        area_h = body - 2
+        if area_h < 2 or w < 20:
+            self.put(y0 + 2, 1, "not enough room for the map", self.DIM)
+            self.map_cells = []
+            return
+
+        self.map_cells, skipped = map_cells(level, 1, y0 + 2, w - 2, area_h)
+        if skipped:
+            small = sum(n.size for n in skipped)
+            tag = f"+{len(skipped)} too small to draw · {human(small)}"
+            self.put(y0 + 1, 1, tag, self.DIM)
+        if not self.map_cells:
+            self.put(y0 + 2, 1, "nothing measured yet…", self.DIM)
+            return
+        self.map_sel = max(0, min(self.map_sel, len(self.map_cells) - 1))
+
+        biggest = max(n.size for n, *_ in self.map_cells) or 1
+        for i, (node, cx, cy, cw, ch) in enumerate(self.map_cells):
+            # a square-root transfer spreads the mid tones on very skewed data
+            # while staying monotone in size, so the ramp still reads as magnitude
+            t = (node.size / biggest) ** 0.5
+            step = min(len(MAP_RAMP) - 1, max(0, round((1 - t) * (len(MAP_RAMP) - 1))))
+            fill = self.map_pairs[step] if self.map_pairs else curses.A_REVERSE
+            if i == self.map_sel:
+                fill |= curses.A_REVERSE
+            dw, dh = max(1, cw - 1), max(1, ch - 1)
+            for r in range(dh):
+                self.put(cy + r, cx, " " * dw, fill)
+                self.zone(cy + r, cx, cx + dw - 1, "cell", i)
+            if dw >= 4:
+                self.put(cy, cx, clip_end(node.label, dw), fill | curses.A_BOLD)
+            if dh >= 2 and dw >= 5:
+                self.put(cy + 1, cx, clip_end(human(node.size), dw), fill)
+            if dh >= 4 and dw >= 12 and total:
+                self.put(cy + 2, cx, f"{node.size / total * 100:.0f}%", fill)
+
+    def draw_scrollbar(self, y0: int, body: int, w: int) -> None:
+        total = len(self.rows)
+        if total <= body:
+            return
+        limit = max(1, total - body)
+        height = max(1, round(body * body / total))
+        top = round(self.top / limit * (body - height))
+        for i in range(body):
+            self.zone(y0 + i, 0, 0, "scroll", i)
+            if top <= i < top + height:
+                self.put(y0 + i, 0, "▌", self.ACCENT)
 
     def parent_of(self, target: Node) -> Node | None:
         stack = list(self.m.categories)
@@ -1534,15 +1839,16 @@ class Tui:
 
     def draw_detail(self, y0: int, height: int, w: int) -> None:
         self.put(y0, 1, "─" * max(0, w - 2), self.DIM)
-        if not self.rows:
+        node = self.focus()
+        if node is None:
             return
-        node = self.rows[self.cursor][0]
         size = human(node.size)
         self.put(y0 + 1, 1, shorten(node.label, w - len(size) - 6), curses.A_BOLD)
         self.put(y0 + 1, w - len(size) - 2, size, curses.A_BOLD | self.magnitude(node.size))
 
         if node.path:
             self.put(y0 + 2, 1, shorten(node.path, w - 3), self.DIM)
+            self.zone(y0 + 2, 1, w - 2, "copypath")
         elif node.children:
             biggest = max(node.children, key=lambda c: c.size)
             leaves = sum(1 for n in self.m.walk([node])
@@ -1551,11 +1857,17 @@ class Tui:
                        f"largest is {biggest.label} at {human(biggest.size)}")
             self.put(y0 + 2, 1, shorten(summary, w - 3), self.DIM)
 
-        if node.note:
-            self.put(y0 + 3, 1, shorten(node.note, w - 3))
+        note = node.note
+        if node.blocked:
+            note = ("not measured — " + BLOCKED_HINT
+                    + (" Showing the previous scan's figure." if node.measured else ""))
+        if note:
+            self.put(y0 + 3, 1, shorten(note, w - 3),
+                     self.RED if node.blocked else 0)
         if node.cmd:
             self.put(y0 + 4, 1, "reclaim", self.DIM)
             self.put(y0 + 4, 9, shorten(node.cmd, w - 12), self.ACCENT)
+            self.zone(y0 + 4, 1, w - 2, "copycmd")
         elif node.path:
             self.put(y0 + 4, 1, "reclaim", self.DIM)
             self.put(y0 + 4, 9, "no single command — inspect it first", self.DIM)
@@ -1576,6 +1888,7 @@ class Tui:
                 self.put(y0 + 5, w - len(hint) - 2, hint, self.DIM)
 
     def draw_footer(self, y: int, w: int) -> None:
+        self.put(y, 0, " " * (w - 1))
         if time.time() < self.message_until:
             self.put(y, 1, self.message, self.ACCENT | curses.A_BOLD)
             return
@@ -1583,32 +1896,83 @@ class Tui:
             self.put(y, 1, f"/{self.filter}█   "
                            f"↵ keep · esc clear", self.ACCENT)
             return
-        full = ("j/k move   ↵ open   e/E expand   / filter   s sort   "
-                "d detail   r rescan   ? keys   q quit")
-        short = "j/k  ↵ open  / filter  ? keys  q quit"
-        self.put(y, 1, full if w > len(full) + 3 else short, self.DIM)
+        # every segment is a click target as well as a key hint
+        if self.view == "map":
+            items = [("j/k", "move", None), ("↵", "open", None),
+                     ("←", "back", "mapup"), ("m", "list", "map"),
+                     ("d", "detail", "detail"), ("r", "rescan", "rescan"),
+                     ("?", "keys", "help"), ("q", "quit", "quit")]
+        else:
+            items = [("j/k", "move", None), ("↵", "open", None),
+                     ("e/E", "expand", "expand"), ("/", "filter", "filter"),
+                     ("s", "sort", "sort"), ("m", "map", "map"),
+                     ("d", "detail", "detail"), ("r", "rescan", "rescan"),
+                     ("?", "keys", "help"), ("q", "quit", "quit")]
+        while items:
+            widths = [len(k) + 1 + len(lbl) for k, lbl, _ in items]
+            if 1 + sum(widths) + 3 * (len(items) - 1) <= w - 2:
+                break
+            items.pop(0) if len(items) > 6 else items.pop(4)
+        x = 1
+        for key, label, kind in items:
+            span = len(key) + 1 + len(label)
+            self.put(y, x, key, self.ACCENT if kind else self.DIM)
+            self.put(y, x + len(key) + 1, label, self.DIM)
+            if kind:
+                self.zone(y, x, x + span - 1, kind)
+            x += span + 3
 
     def draw_help(self, h: int, w: int) -> None:
-        lines: list[tuple[str, str]] = []
-        for section, keys in HELP:
-            lines.append((section, ""))
-            lines.extend(keys)
-            lines.append(("", ""))
-        lines.pop()
-        bw = min(w - 6, 58)
-        bh = min(h - 4, len(lines) + 4)
-        y0 = (h - bh) // 2
-        x0 = (w - bw) // 2
+        """Two columns when there is room, so nothing gets truncated away."""
+        blocks: list[list[tuple[str, str]]] = []
+        for title, keys in HELP:
+            blocks.append([(title, "")] + list(keys))
+
+        keyw = max(len(k) for b in blocks for k, _ in b) + 1
+        descw = max(len(d) for b in blocks for _, d in b) + 1
+        colw = keyw + 2 + descw
+        two = w >= colw * 2 + 10
+
+        def flatten(bs):
+            out: list[tuple[str, str]] = []
+            for b in bs:
+                out.extend(b)
+                out.append(("", ""))
+            return out[:-1] if out else out
+
+        if two:
+            counts = [len(b) + 1 for b in blocks]
+            half, run, split = sum(counts) / 2, 0, len(blocks)
+            for i, c in enumerate(counts):
+                if run + c > half and i:
+                    split = i
+                    break
+                run += c
+            left, right = flatten(blocks[:split]), flatten(blocks[split:])
+        else:
+            left, right = flatten(blocks), []
+
+        rows = max(len(left), len(right))
+        bw = min(w - 4, colw * (2 if two else 1) + (8 if two else 6))
+        bh = min(h - 2, rows + 4)
+        y0, x0 = (h - bh) // 2, (w - bw) // 2
         for i in range(bh):
             self.put(y0 + i, x0, " " * bw, curses.A_REVERSE)
         self.put(y0 + 1, x0 + 2, "andy — keys", curses.A_REVERSE | curses.A_BOLD)
-        for i, (left, right) in enumerate(lines[: bh - 4]):
-            y = y0 + 3 + i
-            if not right:
-                self.put(y, x0 + 2, left, curses.A_REVERSE | curses.A_BOLD)
-            else:
-                self.put(y, x0 + 3, left.ljust(18), curses.A_REVERSE)
-                self.put(y, x0 + 22, right, curses.A_REVERSE)
+
+        def column(lines, cx, room):
+            for i, (key, desc) in enumerate(lines[:room]):
+                y = y0 + 3 + i
+                if not desc:
+                    self.put(y, cx, key, curses.A_REVERSE | curses.A_BOLD)
+                else:
+                    self.put(y, cx + 1, key.ljust(keyw), curses.A_REVERSE)
+                    self.put(y, cx + 1 + keyw + 1, desc, curses.A_REVERSE)
+
+        room = bh - 4
+        column(left, x0 + 2, room)
+        if right:
+            column(right, x0 + 4 + colw, room)
         tail = "any key to close"
         self.put(y0 + bh - 1, x0 + bw - len(tail) - 2, tail, curses.A_REVERSE)
 
@@ -1617,9 +1981,137 @@ class Tui:
     def current(self) -> Node | None:
         return self.rows[self.cursor][0] if self.rows else None
 
+    def focus(self) -> Node | None:
+        """The node the detail pane and the copy actions act on."""
+        if self.view == "map":
+            if 0 <= self.map_sel < len(self.map_cells):
+                return self.map_cells[self.map_sel][0]
+            return None
+        return self.current()
+
+    def map_level(self) -> list[Node]:
+        return self.map_stack[-1].children if self.map_stack else self.m.categories
+
     def move(self, delta: int) -> None:
         if self.rows:
             self.cursor = max(0, min(len(self.rows) - 1, self.cursor + delta))
+
+    def scroll(self, delta: int) -> None:
+        """Move the viewport and carry the cursor along with it."""
+        _, _, _, body, _, _ = self.geometry()
+        limit = max(0, len(self.rows) - body)
+        self.top = max(0, min(limit, self.top + delta))
+        if self.rows:
+            self.cursor = max(self.top, min(self.top + body - 1,
+                                            min(self.cursor, len(self.rows) - 1)))
+
+    def toggle(self, idx: int) -> None:
+        if 0 <= idx < len(self.rows):
+            node = self.rows[idx][0]
+            if node.children:
+                node.expanded = not node.expanded
+
+    def reveal(self, node: Node) -> None:
+        if not node.path:
+            self.note("no path for this item")
+            return
+        try:
+            subprocess.Popen(["open", "-R", node.path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.note("revealed in Finder")
+        except Exception:
+            self.note("could not open Finder")
+
+    def copy_cmd(self, node: Node) -> None:
+        if node.cmd:
+            self.note("copied command" if clip(node.cmd) else "could not copy")
+        else:
+            self.note("no command for this item")
+
+    def mouse_event(self, mx: int, my: int, bstate: int) -> bool:
+        if bstate & curses.BUTTON4_PRESSED:
+            self.scroll(-3)
+            return True
+        if bstate & self.WHEEL_DOWN:
+            self.scroll(3)
+            return True
+
+        kind, payload = self.zone_at(my, mx)
+        if bstate & self.RIGHT_CLICK:
+            if self.view == "map":
+                self.map_up()
+                return True
+            if kind in ("row", "toggle"):
+                self.cursor = payload
+                self.copy_cmd(self.rows[payload][0])
+            return True
+        if not bstate & self.CLICK:
+            return True
+
+        self.typing = False
+        now = time.time()
+        if kind == "scroll":
+            _, _, _, body, _, _ = self.geometry()
+            span = max(1, body - 1)
+            limit = max(0, len(self.rows) - body)
+            self.top = max(0, min(limit, round(payload / span * limit)))
+            self.cursor = max(self.top, min(self.top + body - 1, self.cursor))
+            return True
+        if kind == "mapup":
+            self.map_up()
+            return True
+        if kind == "cell":
+            was, when = self.last_click[1], self.last_click[0]
+            self.map_sel = payload
+            self.last_click = (now, 10_000 + payload)
+            if was == 10_000 + payload and now - when < 0.45:
+                self.map_drill()
+            return True
+        if kind == "map":
+            self.view = "tree" if self.view == "map" else "map"
+            self.map_stack, self.map_sel = [], 0
+            return True
+        if kind == "toggle":
+            self.cursor = payload
+            self.toggle(payload)
+            return True
+        if kind == "row":
+            was, when = self.last_click[1], self.last_click[0]
+            self.cursor = payload
+            self.last_click = (now, payload)
+            node = self.rows[payload][0]
+            if was == payload and now - when < 0.45:      # double click
+                if node.children:
+                    self.toggle(payload)
+                else:
+                    self.reveal(node)
+            return True
+        if kind == "copycmd" and self.rows:
+            self.copy_cmd(self.rows[self.cursor][0])
+        elif kind == "copypath" and self.rows:
+            node = self.rows[self.cursor][0]
+            if node.path:
+                self.note("copied path" if clip(node.path) else "could not copy")
+        elif kind == "filter":
+            self.typing = True
+        elif kind == "sort":
+            self.sort_by_name = not self.sort_by_name
+            self.note("sorted by " + ("name" if self.sort_by_name else "size"))
+        elif kind == "detail":
+            self.detail = not self.detail
+        elif kind == "expand":
+            with self.m.lock:
+                any_open = any(c.expanded for c in self.m.categories if c.children)
+                self.set_expanded(self.m.categories, not any_open)
+            if not self.rows:
+                self.cursor = 0
+        elif kind == "rescan":
+            self.rescan()
+        elif kind == "help":
+            self.help = True
+        elif kind == "quit":
+            return False
+        return True
 
     def set_expanded(self, nodes: list[Node], value: bool) -> None:
         for n in nodes:
@@ -1630,6 +2122,16 @@ class Tui:
     def handle(self, ch: int) -> bool:
         """Returns False to quit."""
         h, w, head, body, detail, foot = self.geometry()
+
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                return True
+            if self.help:
+                self.help = False
+                return True
+            return self.mouse_event(mx, my, bstate)
 
         if self.help:
             self.help = False
@@ -1645,6 +2147,9 @@ class Tui:
             elif 32 <= ch < 127:
                 self.filter += chr(ch)
             return True
+
+        if self.view == "map":
+            return self.handle_map(ch)
 
         node = self.current()
         if ch in (ord("q"), 27):
@@ -1696,30 +2201,78 @@ class Tui:
             self.note("showing everything" if self.show_small else "hiding items under 10M")
         elif ch == ord("d"):
             self.detail = not self.detail
+        elif ch == ord("m"):
+            self.view = "map"
+            self.map_stack, self.map_sel = [], 0
         elif ch == ord("?"):
             self.help = True
         elif ch == ord("c") and node:
-            if node.cmd:
-                self.note("copied command" if clip(node.cmd) else "could not copy")
-            else:
-                self.note("no command for this item")
+            self.copy_cmd(node)
         elif ch == ord("y") and node:
             if node.path:
                 self.note("copied path" if clip(node.path) else "could not copy")
             else:
                 self.note("no path for this item")
-        elif ch == ord("o") and node and node.path:
-            try:
-                subprocess.Popen(["open", "-R", node.path],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.note("revealed in Finder")
-            except Exception:
-                self.note("could not open Finder")
+        elif ch == ord("o") and node:
+            self.reveal(node)
         elif ch == ord("r"):
             self.rescan()
         elif ch == curses.KEY_RESIZE:
             pass
         return True
+
+    def handle_map(self, ch: int) -> bool:
+        node = self.focus()
+        count = len(self.map_cells)
+        if ch == ord("q"):
+            return False
+        if ch in (ord("m"), 27):
+            self.view = "tree"
+        elif ch in (ord("j"), curses.KEY_DOWN, curses.KEY_RIGHT, ord("l"), 9):
+            if count:
+                self.map_sel = (self.map_sel + 1) % count
+        elif ch in (ord("k"), curses.KEY_UP, ord("h")):
+            if count:
+                self.map_sel = (self.map_sel - 1) % count
+        elif ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+            self.map_drill()
+        elif ch in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, 8):
+            self.map_up()
+        elif ch == ord("d"):
+            self.detail = not self.detail
+        elif ch == ord("c") and node:
+            self.copy_cmd(node)
+        elif ch == ord("y") and node:
+            if node.path:
+                self.note("copied path" if clip(node.path) else "could not copy")
+            else:
+                self.note("no path for this item")
+        elif ch == ord("o") and node:
+            self.reveal(node)
+        elif ch == ord("r"):
+            self.rescan()
+        elif ch == ord("?"):
+            self.help = True
+        return True
+
+    def map_drill(self) -> None:
+        node = self.focus()
+        if node is None:
+            return
+        if node.kind == "fold":
+            self.note("too small to open — press m for the list")
+        elif node.children:
+            self.map_stack.append(node)
+            self.map_sel = 0
+        else:
+            self.note("nothing inside this one")
+
+    def map_up(self) -> None:
+        if self.map_stack:
+            self.map_stack.pop()
+            self.map_sel = 0
+        else:
+            self.note("already at the top")
 
     def rescan(self) -> None:
         if not self.m.finished:
@@ -1756,9 +2309,9 @@ class Tui:
                 return
 
 
-def run_tui(model: Model, scanner: Scanner) -> None:
+def run_tui(model: Model, scanner: Scanner, use_mouse: bool = True) -> None:
     def inner(stdscr):
-        Tui(stdscr, model, scanner).loop()
+        Tui(stdscr, model, scanner, use_mouse).loop()
 
     try:
         curses.wrapper(inner)

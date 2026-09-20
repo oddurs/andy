@@ -64,7 +64,8 @@ andy ~/work ~/src     # scan these project roots instead of the defaults
 
 Useful flags: `-n N` how many largest items to list, `-m SIZE` hide anything
 smaller (default `10M`), `--no-projects` to skip the per-project scan when you
-just want the caches, `--fresh` to ignore cached sizes.
+just want the caches, `--fresh` to ignore cached sizes, `--no-mouse` to leave
+your terminal's own text selection alone.
 
 ### The interactive browser
 
@@ -84,6 +85,46 @@ so it is usable before the scan finishes.
 Each bar is drawn against the largest item at that level, so every tier of the
 tree stays readable.
 
+### The area map
+
+Press `m` for a treemap: every category becomes a rectangle whose **area** is its
+share of the total. Click a rectangle to open it, right-click or `←` to come back
+up. The real thing fills each cell with a grey tone; here they are outlined.
+
+```
+ all categories                                                        83.4G in 7
+ +2 too small to draw · 389M
+
+ ┌─ project artifacts ──────────────┐ ┌─ containers & vms ────────┐ ┌─ t…┐ ┌─ pac… ┐
+ │ 36.5G                   44%      │ │ 29.4G            35%      │ │    │ │ 5.0G  │
+ │                                  │ │                           │ │    │ │       │
+ │                                  │ │                           │ │    │ │       │
+ │                                  │ │                           │ │    │ └───────┘
+ │                                  │ │                           │ │    │
+ │                                  │ │                           │ │    │ ┌─ bui… ┐
+ │                                  │ │                           │ │    │ │ 4.7G  │
+ │                                  │ │                           │ │    │ │       │
+ │                                  │ │                           │ │    │ │       │
+ └──────────────────────────────────┘ └───────────────────────────┘ └────┘ └───────┘
+```
+
+Area carries the magnitude, so colour is left to do one job - separate
+neighbouring cells - which a single grey ramp does identically on a light or a
+dark terminal, since each cell supplies its own background. Every cell is
+labelled, so nothing depends on telling two shades apart.
+
+### The mouse
+
+The interactive view is fully mouse-driven: click a row to select it, click the
+`▸` to open a branch, double-click a folder row to reveal it in Finder, and
+right-click to copy a reclaim command. The wheel scrolls, the left edge is a
+scroll bar you can click, and every hint along the bottom is a button. In the
+map, click to select and double-click to drill in.
+
+Mouse reporting takes over your terminal's own click-and-drag text selection -
+hold **shift** to get it back for a moment, or run `andy -i --no-mouse` to leave
+the mouse alone entirely.
+
 | key | |
 | --- | --- |
 | `j` `k` `↑` `↓` | move; `ctrl-d`/`ctrl-u` half page, `g`/`G` ends |
@@ -93,6 +134,7 @@ tree stays readable.
 | `a` | also show items under 10M |
 | `c` | copy the reclaim command to the clipboard |
 | `y` | copy the path; `o` reveals it in Finder |
+| `m` | the area map; `↵` opens a cell, `←` backs out |
 | `d` | toggle the detail pane; `r` rescan; `?` keys; `q` quit |
 
 ## What it looks at
@@ -132,6 +174,14 @@ total, because those are the same bytes.
 cache; expect a minute or two if you have a large container disk. Results are
 cached in `~/.cache/andy/scan.json`, so later runs start from the previous
 numbers and refresh in seconds. `--fresh` skips the cache.
+
+**Nothing is allowed to hang.** `du` on the data directory of a *running*
+container VM can block on I/O for many minutes at no CPU at all, and a network
+mount can do the same. Every measurement is therefore bounded: whatever finished
+is kept, stragglers get one more try alone, and anything still unfinished is
+reported as not measured rather than silently counted as zero - with the previous
+scan's figure shown if there is one. `du -x` also keeps the walk on one
+filesystem, so a mounted share is never counted as local disk.
 
 **`~/Code` and `~/code` are one directory** on a case-insensitive volume. Roots
 are de-duplicated by inode, not by spelling, so nothing is counted twice.
