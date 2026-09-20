@@ -35,3 +35,18 @@ Full cross-platform, not just "it runs".
 - [x] `0017` Itemised children are dropped from their category's total <sup>bug · p0</sup>
 - [x] `0018` A HOME that does not exist crashes andy on startup <sup>bug · p1</sup>
 
+## v1.3 — v1.3
+
+`##########` 100% · 6 of 6 done · due 2027-01-31
+
+Faster, honest about change, and tested where it is least tested.
+
+### done
+
+- [x] `0020` du output cannot represent a path with a newline <sup>bug · p0</sup>
+- [x] `0021` Half the measured paths are walked twice <sup>bug · p0</sup>
+- [x] `0022` Nothing says what grew since last time <sup>feature · p1</sup>
+- [x] `0023` The interactive browser has no tests at all <sup>chore · p1</sup>
+- [x] `0024` A narrow terminal crashes the footer <sup>bug · p0</sup>
+- [x] `0025` The browser hides the locations it could not measure <sup>bug · p1</sup>
+

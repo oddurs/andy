@@ -101,7 +101,15 @@ class Scan(unittest.TestCase):
         # `docker system df` reports -- there is no VM disk there for it to
         # duplicate -- so on any machine with a running daemon this scan would
         # otherwise pick up its images and measure the runner, not the tree.
-        patches = mock.patch.multiple(andy, CATALOG=[], docker_breakdown=lambda: [])
+        #
+        # The cache goes somewhere disposable too. A scan saves its results
+        # whatever --fresh said, so without this the suite overwrites the real
+        # ~/.cache/andy/scan.json with a handful of temp directories -- and the
+        # next `andy --delta` reports the user's whole disk as new.
+        cache = os.path.join(self.root, "cache")
+        patches = mock.patch.multiple(
+            andy, CATALOG=[], docker_breakdown=lambda: [],
+            CACHE_DIR=cache, CACHE_FILE=os.path.join(cache, "scan.json"))
         patches.start()
         self.addCleanup(patches.stop)
 
@@ -150,6 +158,37 @@ class Scan(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, "svc", "target", "debug.bin")))
 
 
+class CacheIsolation(unittest.TestCase):
+    """The suite must not write to the real cache.
+
+    A scan saves its results whatever --fresh said. Without isolation the tests
+    replace ~/.cache/andy/scan.json with a few temp directories, and the next
+    `andy --delta` a person runs reports their entire disk as new. It happened.
+    """
+
+    def test_a_scan_writes_only_where_it_was_pointed(self):
+        real = andy.CACHE_FILE                  # unpatched: the user's own
+        before = os.stat(real).st_mtime_ns if os.path.exists(real) else None
+
+        tree = tempfile.mkdtemp(prefix="andy-iso-")
+        self.addCleanup(shutil.rmtree, tree, ignore_errors=True)
+        cache = os.path.join(tree, "cache")
+        model = andy.Model()
+        scanner = andy.Scanner(model, [], include_projects=False, use_cache=False)
+        with mock.patch.object(andy, "CATALOG", []), \
+             mock.patch.object(andy, "docker_breakdown", lambda: []), \
+             mock.patch.object(andy, "CACHE_DIR", cache), \
+             mock.patch.object(andy, "CACHE_FILE", os.path.join(cache, "scan.json")):
+            scanner.start()
+            scanner.join(60)
+
+        self.assertTrue(os.path.exists(os.path.join(cache, "scan.json")),
+                        "the scan did not save where it was told to")
+        after = os.stat(real).st_mtime_ns if os.path.exists(real) else None
+        self.assertEqual(before, after,
+                         "a scan wrote to the real cache despite being redirected")
+
+
 class LiveDocker(unittest.TestCase):
     """What a running daemon contributes, which differs by platform.
 
@@ -164,7 +203,11 @@ class LiveDocker(unittest.TestCase):
     def scan(self):
         model = andy.Model()
         scanner = andy.Scanner(model, [], include_projects=False, use_cache=False)
+        cache = tempfile.mkdtemp(prefix="andy-livecache-")
+        self.addCleanup(shutil.rmtree, cache, ignore_errors=True)
         with mock.patch.object(andy, "CATALOG", []), \
+             mock.patch.object(andy, "CACHE_DIR", cache), \
+             mock.patch.object(andy, "CACHE_FILE", os.path.join(cache, "scan.json")), \
              mock.patch.object(andy, "docker_breakdown", lambda: self.ROWS):
             scanner.start()
             scanner.join(60)

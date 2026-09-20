@@ -61,11 +61,41 @@ ln -s "$PWD/andy/andy" ~/.local/bin/andy
 ```sh
 andy                  # the ranked summary above
 andy -i               # browse it interactively
+andy --delta          # what changed since the last run
 andy --tree           # every location, grouped
 andy --commands       # reclaim commands as a commented shell script
 andy --json           # machine-readable, for scripts and dashboards
 andy ~/work ~/src     # scan these project roots instead of the defaults
 ```
+
+### What changed
+
+`andy --delta` subtracts the previous scan from this one. The interesting
+number on a full disk is rarely the biggest thing — it is the thing that was
+not there last week.
+
+```
+ andy  change since the previous scan, 3 days ago
+
+ changed  2 locations
+
+   +4.2G  cargo/maven target   3.1G → 7.3G
+   -840M  Xcode DerivedData    1.2G → 412M
+
+ new  8.0M in 1 location andy had not measured before, which may mean created
+      or merely recognised
+
+   8.0M  dashboard/node_modules   ~/Code/dashboard/node_modules
+
+  net  +3.4G  across the 2 locations andy could compare
+```
+
+Three totals rather than one, because they are not equally trustworthy. A
+location with no previous figure might be newly created, or it might be one
+andy only started recognising when the catalog grew — so it is counted apart
+from the change andy can actually vouch for. The interval is stated rather than
+implied: the comparison is against whenever andy last ran, which might be ten
+minutes or three weeks.
 
 Useful flags: `-n N` how many largest items to list, `-m SIZE` hide anything
 smaller (default `10M`), `--no-projects` to skip the per-project scan when you
@@ -264,6 +294,10 @@ The roadmap and the open issues live in the repository, as Markdown under
 python3 -m unittest discover -s tests     # the whole suite
 python3 -m unittest discover -s tests -v  # one line per test
 ```
+
+Around 300 tests, including the interactive browser: most of it is arithmetic
+over a model and runs against a screen object that records instead of
+rendering, and the rest is driven through a pty.
 
 The tests need nothing installed. andy is a zero-dependency program, and a test
 suite you have to `pip install` something to run is a test suite that stops
