@@ -2,7 +2,7 @@
 id: 14
 title: The Linux catalog is still thin
 type: feature
-status: backlog
+status: done
 milestone: v1.2
 created: 2026-09-20
 updated: 2026-09-20
@@ -35,7 +35,7 @@ v1.1 gave Linux the XDG twins of what macOS already had. That is the layout, not
 - rootful podman: /var/lib/containers
 
 Acceptance criteria
-- [ ] Each entry has a note, a safety rating and a command or a deliberate blank
-- [ ] Nothing that needs root is rated safe
-- [ ] The catalog invariant tests still pass
-- [ ] README updated
+- [x] Each entry has a note, a safety rating and a command or a deliberate blank
+- [x] Nothing that needs root is rated safe
+- [x] The catalog invariant tests still pass
+- [x] README updated

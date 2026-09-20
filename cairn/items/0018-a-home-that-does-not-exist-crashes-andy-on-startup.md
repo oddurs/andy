@@ -2,7 +2,7 @@
 id: 18
 title: A HOME that does not exist crashes andy on startup
 type: bug
-status: backlog
+status: done
 milestone: v1.2
 created: 2026-09-20
 updated: 2026-09-20
@@ -47,7 +47,7 @@ then give up and report zeros. The report already handles a zero total, because
 
 ## Acceptance criteria
 
-- [ ] Every mode runs with `HOME` set to a path that does not exist
-- [ ] The volume line degrades rather than the program
-- [ ] A rescan in the TUI uses the same fallback
-- [ ] Tested with a missing `HOME`, not only a present one
+- [x] Every mode runs with `HOME` set to a path that does not exist
+- [x] The volume line degrades rather than the program
+- [x] A rescan in the TUI uses the same fallback
+- [x] Tested with a missing `HOME`, not only a present one

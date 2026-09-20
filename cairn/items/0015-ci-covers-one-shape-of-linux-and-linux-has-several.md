@@ -2,7 +2,7 @@
 id: 15
 title: CI covers one shape of Linux, and Linux has several
 type: chore
-status: backlog
+status: done
 milestone: v1.2
 created: 2026-09-20
 updated: 2026-09-20
@@ -25,8 +25,8 @@ Proposal: add jobs for the shapes that break it.
 Each of these is a few lines and they run in seconds. The point is that all four are configurations a real user has and CI did not.
 
 Acceptance criteria
-- [ ] Alpine job: suite green, both engines agree on busybox du
-- [ ] no-curses job: every non-TUI mode works, -i fails cleanly
-- [ ] C-locale job: every output mode runs clean
-- [ ] XDG job: andy finds files in relocated XDG directories
-- [ ] All green on GitHub, not just locally
+- [x] Alpine job: suite green, both engines agree on busybox du
+- [x] no-curses job: every non-TUI mode works, -i fails cleanly
+- [x] C-locale job: every output mode runs clean
+- [x] XDG job: andy finds files in relocated XDG directories
+- [x] All green on GitHub, not just locally

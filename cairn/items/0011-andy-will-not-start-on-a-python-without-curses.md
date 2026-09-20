@@ -2,7 +2,7 @@
 id: 11
 title: andy will not start on a Python without curses
 type: bug
-status: backlog
+status: done
 milestone: v1.2
 created: 2026-09-20
 updated: 2026-09-20
@@ -32,7 +32,7 @@ This is not exotic. Minimal container images, Python built from source without n
 Proposal: import curses in a try/except at module scope and let it be None; move the three mouse constants off the class body into setup(), which only runs inside curses.wrapper. -i then fails with a sentence instead of a traceback, and every other mode works.
 
 Acceptance criteria
-- [ ] andy --json, --tree, --commands and the default report all work with no _curses
-- [ ] andy -i without curses prints one clear line and exits non-zero
-- [ ] With curses present nothing changes
-- [ ] A test removes curses from sys.modules and proves it
+- [x] andy --json, --tree, --commands and the default report all work with no _curses
+- [x] andy -i without curses prints one clear line and exits non-zero
+- [x] With curses present nothing changes
+- [x] A test removes curses from sys.modules and proves it

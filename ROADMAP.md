@@ -19,19 +19,19 @@ Correctness, speed and reach.
 
 ## v1.2 — v1.2
 
-`··········` 0% · 0 of 9 done · due 2026-12-15
+`##########` 100% · 9 of 9 done · due 2026-12-15
 
 Full cross-platform, not just "it runs".
 
-### backlog
+### done
 
-- [ ] `0010` XDG base directories are ignored <sup>bug · p0</sup>
-- [ ] `0011` andy will not start on a Python without curses <sup>bug · p0</sup>
-- [ ] `0012` A non-UTF-8 locale crashes the report <sup>bug · p1</sup>
-- [ ] `0013` andy counts its own cache directory <sup>bug · p3</sup>
-- [ ] `0014` The Linux catalog is still thin <sup>feature · p2</sup>
-- [ ] `0015` CI covers one shape of Linux, and Linux has several <sup>chore · p1</sup>
-- [ ] `0016` Itemised children have never appeared: expand globs are not expanded <sup>bug · p0</sup>
-- [ ] `0017` Itemised children are dropped from their category's total <sup>bug · p0</sup>
-- [ ] `0018` A HOME that does not exist crashes andy on startup <sup>bug · p1</sup>
+- [x] `0010` XDG base directories are ignored <sup>bug · p0</sup>
+- [x] `0011` andy will not start on a Python without curses <sup>bug · p0</sup>
+- [x] `0012` A non-UTF-8 locale crashes the report <sup>bug · p1</sup>
+- [x] `0013` andy counts its own cache directory <sup>bug · p3</sup>
+- [x] `0014` The Linux catalog is still thin <sup>feature · p2</sup>
+- [x] `0015` CI covers one shape of Linux, and Linux has several <sup>chore · p1</sup>
+- [x] `0016` Itemised children have never appeared: expand globs are not expanded <sup>bug · p0</sup>
+- [x] `0017` Itemised children are dropped from their category's total <sup>bug · p0</sup>
+- [x] `0018` A HOME that does not exist crashes andy on startup <sup>bug · p1</sup>
 
