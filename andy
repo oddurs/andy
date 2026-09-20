@@ -556,8 +556,14 @@ class DuMeasurer(Measurer):
         proc = None
         mangled = False
         try:
+            # Read bytes, not text. A path is not locale text: in a C locale
+            # `text=True` decodes du's output as ASCII and the first non-ASCII
+            # path raises, which the handler below would swallow into a silent
+            # under-count. os.fsdecode uses the filesystem encoding with
+            # surrogateescape, so even a path that is valid in no encoding
+            # survives the round trip.
             proc = subprocess.Popen(["du", "-kx", walk.root], stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                    stderr=subprocess.DEVNULL)
             with self._procs_lock:
                 self._procs.add(proc)
             child: dict[str, int] = {}
@@ -565,11 +571,12 @@ class DuMeasurer(Measurer):
             for line in proc.stdout:
                 if self._stop:
                     break
-                kb, _, path = line.rstrip("\n").partition("\t")
+                kb, _, raw = line.rstrip(b"\n").partition(b"\t")
                 try:
                     size = int(kb) * 1024
                 except ValueError:
                     continue            # a warning on stdout, or a stray line
+                path = os.fsdecode(raw)
                 if path != walk.root and not path.startswith(prefix):
                     # du -kx <root> only ever prints paths under <root>. Anything
                     # else is half of a path containing a newline, which this

@@ -8,6 +8,7 @@ one that is wrong.
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,10 +21,15 @@ MB = 2 ** 20
 
 
 def du(path):
-    """The oracle: what `du -skx` says, straight from the system's own tool."""
-    out = subprocess.run(["du", "-skx", path], capture_output=True, text=True,
+    """The oracle: what `du -skx` says, straight from the system's own tool.
+
+    Bytes, then os.fsdecode, for the same reason andy does it: in a C locale
+    text mode would decode a path as ASCII and raise on the first one that
+    is not.
+    """
+    out = subprocess.run(["du", "-skx", path], capture_output=True,
                          timeout=120).stdout
-    return int(out.split("\t")[0]) * 1024
+    return int(out.split(b"\t")[0]) * 1024
 
 
 ENGINES = (andy.DuMeasurer, andy.Walker)
@@ -381,8 +387,18 @@ class OddPaths(Tree):
     def test_a_tab_in_a_directory_name(self):
         self.assertBothEngines(self.build("ta\tbbed"))
 
-    def test_spaces_and_non_ascii(self):
+    def test_spaces(self):
         self.assertBothEngines(self.build("with space"))
+
+    @unittest.skipUnless(
+        andy.encodable("\u043f\u0440\u043e\u0435\u043a\u0442-\u65e5\u672c",
+                       type("S", (), {"encoding": sys.getfilesystemencoding()})),
+        "this filesystem encoding cannot name such a directory")
+    def test_non_ascii(self):
+        """cairn 0026. On macOS the filesystem stays UTF-8 whatever the locale
+        says, so this runs under LC_ALL=C and used to under-report in silence.
+        Where the filesystem encoding really is ASCII the name cannot exist at
+        all, and there is nothing to measure or to claim."""
         self.assertBothEngines(self.build("\u043f\u0440\u043e\u0435\u043a\u0442-\u65e5\u672c"))
 
     def test_the_fallback_is_what_ran(self):
