@@ -2,7 +2,7 @@
 id: 17
 title: Itemised children are dropped from their category's total
 type: bug
-status: backlog
+status: done
 milestone: v1.2
 created: 2026-09-20
 updated: 2026-09-20
@@ -57,8 +57,16 @@ tree and the map where it is the point.
 
 ## Acceptance criteria
 
-- [ ] A measured node's size includes its itemised children
-- [ ] No byte is counted twice: the category total is unchanged by itemisation
-- [ ] `--tree` shows a breakdown even when the parent's own remainder is zero
-- [ ] "largest items" lists locations, not their breakdowns
-- [ ] A test pins the roll-up against itemised children
+- [x] A measured node's size includes its itemised children
+- [x] No byte is counted twice: the category total is unchanged by itemisation
+- [x] `--tree` shows a breakdown even when the parent's own remainder is zero
+- [x] "largest items" lists locations, not their breakdowns
+- [x] A test pins the roll-up against itemised children
+
+## 2026-09-20
+
+Latent behind 0016 -- there were never any itemised children to lose -- and it lost all of them at once when there were.
+
+roll() subtracted the children from the parent (so nothing counts twice) and then returned only the remainder to the category. For a location whose children itemise all of it the remainder is zero, so rustup toolchains measured 6.6G, its seven toolchains accounted for the lot, and the category reported 778M instead of 7.4G. print_tree compounded it: a parent below the -m floor is skipped with continue, which skips the recursion, so the children vanished from the tree as well.
+
+The fix is one line -- inner takes them out, sum(contributions) puts them back, net measured -- plus a `detail` flag so a breakdown is not also counted as a location. Without that, largest items would list rustup toolchains and each toolchain inside it, which is the same bytes said twice.

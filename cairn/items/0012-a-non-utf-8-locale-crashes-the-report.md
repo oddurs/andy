@@ -2,7 +2,7 @@
 id: 12
 title: A non-UTF-8 locale crashes the report
 type: bug
-status: backlog
+status: done
 milestone: v1.2
 created: 2026-09-20
 updated: 2026-09-20
@@ -32,8 +32,16 @@ Proposal: decide once at startup whether stdout can encode the glyphs, and keep 
 Not a fallback nobody sees: -m/--min output piped into a file or a log under systemd hits this.
 
 Acceptance criteria
-- [ ] Every output mode runs clean under PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 LC_ALL=C
-- [ ] The ASCII rendering is deliberate and readable, not mojibake or question marks
-- [ ] UTF-8 output is byte-identical to before
-- [ ] Chosen from the actual stdout encoding, not from the platform
-- [ ] Tested by forcing the encoding rather than by trusting the environment
+- [x] Every output mode runs clean under PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 LC_ALL=C
+- [x] The ASCII rendering is deliberate and readable, not mojibake or question marks
+- [x] UTF-8 output is byte-identical to before
+- [x] Chosen from the actual stdout encoding, not from the platform
+- [x] Tested by forcing the encoding rather than by trusting the environment
+
+## 2026-09-20
+
+The glyph table is the interesting part, not the fallback. Every drawing character in the file now goes through it, and a test walks the source asserting none is written inline -- otherwise the ASCII set drifts out of step with the Unicode one the first time someone adds a row.
+
+That test immediately found six more: an em dash, a breadcrumb chevron and the four arrow keys in the help.
+
+The suite itself was not locale-independent either. Seven tests hardcoded the Unicode glyphs and failed under LC_ALL=C, which is why the c-locale CI job runs the suite as well as the program.
