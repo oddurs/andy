@@ -1,0 +1,1774 @@
+#!/usr/bin/env python3
+"""
+devspace — a read-only TUI that shows where developer tooling hides your disk.
+
+Containers and VM images, package manager caches, toolchains, build caches,
+Xcode junk, model weights and per-project artifacts, measured and ranked.
+
+Nothing is ever deleted, moved or modified. For each item devspace shows the
+command that would reclaim it, and can copy that command to your clipboard --
+running it is your call.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import glob
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+
+HOME = os.path.expanduser("~")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "devspace")
+CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
+VERSION = "1.0.0"
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+def human(n: int, pad: bool = False) -> str:
+    """Bytes as a short human string: 4.7G, 812M, 3.1K."""
+    if n <= 0:
+        return "    -" if pad else "-"
+    for unit, step in (("T", 2 ** 40), ("G", 2 ** 30), ("M", 2 ** 20), ("K", 2 ** 10)):
+        if n >= step:
+            v = n / step
+            s = f"{v:.0f}{unit}" if v >= 100 else f"{v:.1f}{unit}"
+            break
+    else:
+        s = f"{n}B"
+    return s.rjust(5) if pad else s
+
+
+def tilde(path: str) -> str:
+    if path == HOME:
+        return "~"
+    return "~" + path[len(HOME):] if path.startswith(HOME + os.sep) else path
+
+
+def shorten(text: str, width: int) -> str:
+    """Trim to width, eliding the middle of long paths."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    keep = width - 1
+    head = keep // 3
+    return text[:head] + "…" + text[len(text) - (keep - head):]
+
+
+BLOCKS = " ▏▎▍▌▋▊▉█"
+
+
+def bar(fraction: float, width: int) -> str:
+    """A horizontal bar with one-eighth-cell precision."""
+    if width <= 0:
+        return ""
+    fraction = max(0.0, min(1.0, fraction))
+    eighths = int(round(fraction * width * 8))
+    full, rem = divmod(eighths, 8)
+    full = min(full, width)
+    out = "█" * full
+    if rem and full < width:
+        out += BLOCKS[rem]
+    return out.ljust(width)
+
+
+def clip(text: str) -> bool:
+    """Put text on the clipboard. Read-only with respect to the filesystem."""
+    try:
+        p = subprocess.run(["pbcopy"], input=text, text=True, timeout=5)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def du_batch(paths: list[str]) -> dict[str, int]:
+    """Measure several paths with one du(1). Returns bytes keyed by path."""
+    sizes: dict[str, int] = {}
+    if not paths:
+        return sizes
+    try:
+        p = subprocess.run(
+            ["du", "-sk", *paths],
+            capture_output=True, text=True, timeout=900,
+        )
+    except Exception:
+        return sizes
+    for line in p.stdout.splitlines():
+        kb, _, path = line.partition("\t")
+        try:
+            sizes[path] = int(kb.strip()) * 1024
+        except ValueError:
+            continue
+    return sizes
+
+
+def usable_dir(path: str) -> bool:
+    return os.path.isdir(path) and not os.path.islink(path)
+
+
+# --------------------------------------------------------------------------- #
+# catalog
+# --------------------------------------------------------------------------- #
+
+CONTAINERS = "containers & vms"
+PROJECTS = "project artifacts"
+PACKAGES = "package caches"
+APPLE = "xcode & simulators"
+TOOLCHAINS = "toolchains & runtimes"
+BUILD = "build & test caches"
+MODELS = "models & datasets"
+APPS = "dev app caches"
+REPOS = "git repositories"
+
+SAFE = "safe"          # regenerates itself, no thought required
+REBUILD = "rebuild"    # fine to delete, but you pay a rebuild
+REVIEW = "review"      # may hold something you actually want
+
+
+@dataclass(frozen=True)
+class Spec:
+    cat: str
+    label: str
+    path: str
+    note: str = ""
+    cmd: str = ""
+    safety: str = SAFE
+    expand: str | None = None   # glob for itemised children
+    namer: str | None = None    # "simulator" for device.plist lookup
+
+
+def S(cat, label, path, note="", cmd="", safety=SAFE, expand=None, namer=None) -> Spec:
+    return Spec(cat, label, os.path.expanduser(path), note, cmd, safety, expand, namer)
+
+
+CATALOG: list[Spec] = [
+    # ---------------------------------------------------------------- containers
+    S(CONTAINERS, "OrbStack", "~/Library/Group Containers/HUAQ24HBR6.dev.orbstack",
+      "Sparse disk holding every OrbStack container, image, volume and Linux machine.",
+      "docker system prune -a --volumes   # then OrbStack reclaims the disk", REBUILD),
+    S(CONTAINERS, "Docker Desktop VM", "~/Library/Containers/com.docker.docker/Data",
+      "Docker Desktop's Linux VM disk (docker.raw) plus its own caches.",
+      "docker system prune -a --volumes", REBUILD),
+    S(CONTAINERS, "Docker config & contexts", "~/.docker",
+      "CLI config, contexts and credential helpers. Small; keep it.", "", REVIEW),
+    S(CONTAINERS, "Colima", "~/.colima", "Colima VM disks, one per profile.",
+      "colima delete <profile>", REBUILD),
+    S(CONTAINERS, "Lima", "~/.lima", "Lima VM disk images.", "limactl delete <vm>", REBUILD),
+    S(CONTAINERS, "Podman machines", "~/.local/share/containers",
+      "Podman machine images and container storage.", "podman system reset", REBUILD),
+    S(CONTAINERS, "Rancher Desktop", "~/Library/Application Support/rancher-desktop",
+      "Rancher Desktop VM and k3s state.", "", REBUILD),
+    S(CONTAINERS, "Vagrant boxes", "~/.vagrant.d/boxes",
+      "Downloaded base boxes, re-downloadable.", "vagrant box prune", REBUILD),
+    S(CONTAINERS, "UTM VMs", "~/Library/Containers/com.utmapp.UTM/Data/Documents",
+      "UTM virtual machine bundles.", "", REVIEW),
+    S(CONTAINERS, "VirtualBox VMs", "~/VirtualBox VMs", "VirtualBox disk images.", "", REVIEW),
+    S(CONTAINERS, "Parallels VMs", "~/Parallels", "Parallels virtual machine bundles.", "", REVIEW),
+    S(CONTAINERS, "minikube", "~/.minikube", "minikube cluster disks and cached ISOs.",
+      "minikube delete --all --purge", REBUILD),
+    S(CONTAINERS, "kind / k3d images", "~/.kube/cache", "Kubernetes client discovery cache.",
+      "rm -rf ~/.kube/cache", SAFE),
+
+    # ------------------------------------------------------------- package caches
+    S(PACKAGES, "npm cache", "~/.npm",
+      "Every tarball npm ever downloaded, plus its logs.", "npm cache clean --force"),
+    S(PACKAGES, "npx package cache", "~/.npm/_npx",
+      "A throwaway install tree per tool you ever ran with npx.", "rm -rf ~/.npm/_npx"),
+    S(PACKAGES, "pnpm store", "~/Library/pnpm/store",
+      "Content-addressed store shared by all pnpm projects.", "pnpm store prune"),
+    S(PACKAGES, "pnpm store (legacy)", "~/.pnpm-store", "Older pnpm store location.",
+      "pnpm store prune"),
+    S(PACKAGES, "Yarn cache", "~/Library/Caches/Yarn", "Yarn 1 global cache.",
+      "yarn cache clean"),
+    S(PACKAGES, "Yarn Berry cache", "~/.yarn/berry/cache", "Yarn 2+ zip cache.",
+      "yarn cache clean --all"),
+    S(PACKAGES, "Bun install cache", "~/.bun/install/cache", "Bun's package cache.",
+      "bun pm cache rm"),
+    S(PACKAGES, "Deno cache", "~/Library/Caches/deno",
+      "Remote modules and compiled artifacts.", "deno clean"),
+    S(PACKAGES, "Cargo registry", "~/.cargo/registry",
+      "Crate sources and .crate archives for every dependency you have built.",
+      "cargo cache --autoclean   # or rm -rf ~/.cargo/registry/{cache,src}"),
+    S(PACKAGES, "Cargo git checkouts", "~/.cargo/git",
+      "Full clones of git dependencies.", "rm -rf ~/.cargo/git/{db,checkouts}"),
+    S(PACKAGES, "Go module cache", "~/go/pkg/mod",
+      "Source of every Go module you have fetched.", "go clean -modcache", REBUILD),
+    S(PACKAGES, "pip cache", "~/Library/Caches/pip", "Downloaded and built wheels.",
+      "pip cache purge"),
+    S(PACKAGES, "uv cache", "~/.cache/uv", "uv's wheel and source cache.", "uv cache clean"),
+    S(PACKAGES, "uv managed pythons", "~/.local/share/uv",
+      "Python interpreters and tools uv installed.", "uv python list", REVIEW),
+    S(PACKAGES, "Poetry cache", "~/Library/Caches/pypoetry",
+      "Poetry artifacts plus its virtualenvs.", "poetry cache clear --all .", REVIEW),
+    S(PACKAGES, "Maven repository", "~/.m2/repository", "Every jar Maven or Gradle resolved.",
+      "rm -rf ~/.m2/repository", REBUILD),
+    S(PACKAGES, "Gradle caches", "~/.gradle/caches",
+      "Dependency and build caches; the usual JVM disk hog.",
+      "rm -rf ~/.gradle/caches", REBUILD),
+    S(PACKAGES, "Gradle wrappers", "~/.gradle/wrapper/dists",
+      "One full Gradle distribution per version any project pinned.",
+      "rm -rf ~/.gradle/wrapper/dists", REBUILD),
+    S(PACKAGES, "CocoaPods cache", "~/Library/Caches/CocoaPods", "Downloaded pod archives.",
+      "pod cache clean --all"),
+    S(PACKAGES, "CocoaPods specs", "~/.cocoapods/repos",
+      "The full CocoaPods trunk spec repo clone.", "pod repo remove trunk", REBUILD),
+    S(PACKAGES, "Carthage cache", "~/Library/Caches/org.carthage.CarthageKit",
+      "Carthage sources and prebuilt binaries.", "rm -rf ~/Library/Caches/org.carthage.CarthageKit"),
+    S(PACKAGES, "SwiftPM cache", "~/Library/Caches/org.swift.swiftpm",
+      "Swift Package Manager checkouts and artifacts.", "rm -rf ~/Library/Caches/org.swift.swiftpm"),
+    S(PACKAGES, "Homebrew downloads", "~/Library/Caches/Homebrew",
+      "Bottles and source archives kept after install.", "brew cleanup --prune=all"),
+    S(PACKAGES, "RubyGems", "~/.gem", "Installed gems and their caches.", "gem cleanup", REVIEW),
+    S(PACKAGES, "Bundler cache", "~/.bundle/cache", "Vendored gem archives.",
+      "rm -rf ~/.bundle/cache"),
+    S(PACKAGES, "Composer cache", "~/.composer/cache", "PHP package cache.",
+      "composer clear-cache"),
+    S(PACKAGES, "NuGet packages", "~/.nuget/packages", "Extracted .NET packages.",
+      "dotnet nuget locals all --clear", REBUILD),
+    S(PACKAGES, "pub cache", "~/.pub-cache", "Dart and Flutter packages.",
+      "dart pub cache clean", REBUILD),
+    S(PACKAGES, "Stack (Haskell)", "~/.stack", "GHC installs and package databases.",
+      "", REBUILD),
+    S(PACKAGES, "Cabal store", "~/.cabal", "Cabal package store.", "", REBUILD),
+    S(PACKAGES, "opam (OCaml)", "~/.opam", "opam switches and compilers.", "", REBUILD),
+    S(PACKAGES, "Hex / Mix", "~/.hex", "Elixir package cache.", "mix hex.clean"),
+    S(PACKAGES, "Conan", "~/.conan2", "C++ package cache.", "conan cache clean '*'"),
+    S(PACKAGES, "vcpkg", "~/.cache/vcpkg", "vcpkg binary and asset cache.",
+      "rm -rf ~/.cache/vcpkg"),
+    S(PACKAGES, "conda packages", "~/.conda/pkgs", "Extracted conda packages and tarballs.",
+      "conda clean --all"),
+
+    # --------------------------------------------------------- toolchains/runtimes
+    S(TOOLCHAINS, "rustup toolchains", "~/.rustup/toolchains",
+      "A full Rust toolchain per channel. Old nightlies add up fast.",
+      "rustup toolchain list   # then: rustup toolchain uninstall <name>",
+      REVIEW, expand="~/.rustup/toolchains/*"),
+    S(TOOLCHAINS, "rustup downloads", "~/.rustup/downloads", "Interrupted toolchain downloads.",
+      "rm -rf ~/.rustup/downloads"),
+    S(TOOLCHAINS, "nvm node versions", "~/.nvm/versions/node",
+      "Every Node version you ever installed, with its global npm tree.",
+      "nvm uninstall <version>", REVIEW, expand="~/.nvm/versions/node/*"),
+    S(TOOLCHAINS, "fnm node versions", "~/Library/Application Support/fnm/node-versions",
+      "fnm-managed Node installs.", "fnm uninstall <version>", REVIEW,
+      expand="~/Library/Application Support/fnm/node-versions/*"),
+    S(TOOLCHAINS, "Volta tools", "~/.volta", "Volta-managed Node, npm and binaries.",
+      "", REVIEW),
+    S(TOOLCHAINS, "pyenv versions", "~/.pyenv/versions", "One CPython build per version.",
+      "pyenv uninstall <version>", REVIEW, expand="~/.pyenv/versions/*"),
+    S(TOOLCHAINS, "rbenv versions", "~/.rbenv/versions", "One Ruby build per version.",
+      "rbenv uninstall <version>", REVIEW, expand="~/.rbenv/versions/*"),
+    S(TOOLCHAINS, "asdf installs", "~/.asdf/installs", "All asdf-managed runtimes.",
+      "asdf uninstall <plugin> <version>", REVIEW, expand="~/.asdf/installs/*"),
+    S(TOOLCHAINS, "mise installs", "~/.local/share/mise", "mise-managed runtimes and caches.",
+      "mise prune", REVIEW),
+    S(TOOLCHAINS, "SDKMAN candidates", "~/.sdkman/candidates",
+      "JDKs and JVM tools, several hundred MB each.", "sdk uninstall java <version>",
+      REVIEW, expand="~/.sdkman/candidates/*"),
+    S(TOOLCHAINS, "Local JDKs", "~/Library/Java/JavaVirtualMachines",
+      "User-installed JDKs.", "", REVIEW, expand="~/Library/Java/JavaVirtualMachines/*"),
+    S(TOOLCHAINS, "ghcup (Haskell)", "~/.ghcup", "GHC and cabal toolchains.",
+      "ghcup gc", REVIEW),
+    S(TOOLCHAINS, ".NET SDK", "~/.dotnet", "User-local .NET SDKs and tools.", "", REVIEW),
+    S(TOOLCHAINS, "Android SDK", "~/Library/Android/sdk",
+      "Platforms, build-tools, NDKs and system images.", "sdkmanager --uninstall <pkg>",
+      REVIEW, expand="~/Library/Android/sdk/*"),
+    S(TOOLCHAINS, "Android emulators", "~/.android/avd",
+      "AVD disk images; several GB per virtual device.", "avdmanager delete avd -n <name>",
+      REBUILD, expand="~/.android/avd/*"),
+    S(TOOLCHAINS, "Flutter SDK cache", "~/.flutter", "Flutter engine artifacts.", "", REBUILD),
+
+    # ------------------------------------------------------------ xcode / simulators
+    S(APPLE, "Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData",
+      "Build intermediates and indexes. The single safest big win on a Mac.",
+      "rm -rf ~/Library/Developer/Xcode/DerivedData/*", REBUILD,
+      expand="~/Library/Developer/Xcode/DerivedData/*"),
+    S(APPLE, "Simulator devices", "~/Library/Developer/CoreSimulator/Devices",
+      "One full disk image per simulated device you have ever booted.",
+      "xcrun simctl delete unavailable   # or: xcrun simctl erase all", REBUILD,
+      expand="~/Library/Developer/CoreSimulator/Devices/*", namer="simulator"),
+    S(APPLE, "Simulator caches", "~/Library/Developer/CoreSimulator/Caches",
+      "Downloaded runtime images and dyld caches.",
+      "rm -rf ~/Library/Developer/CoreSimulator/Caches"),
+    S(APPLE, "iOS DeviceSupport", "~/Library/Developer/Xcode/iOS DeviceSupport",
+      "Debug symbols per physical device and OS version. Regenerated on reconnect.",
+      "rm -rf ~/Library/Developer/Xcode/iOS\\ DeviceSupport/*", REBUILD,
+      expand="~/Library/Developer/Xcode/iOS DeviceSupport/*"),
+    S(APPLE, "watchOS DeviceSupport", "~/Library/Developer/Xcode/watchOS DeviceSupport",
+      "As above, for watches.", "rm -rf ~/Library/Developer/Xcode/watchOS\\ DeviceSupport/*", REBUILD),
+    S(APPLE, "Xcode archives", "~/Library/Developer/Xcode/Archives",
+      "Every .xcarchive you ever built, with dSYMs. Needed to symbolise old crashes.",
+      "", REVIEW, expand="~/Library/Developer/Xcode/Archives/*"),
+    S(APPLE, "Xcode products", "~/Library/Developer/Xcode/Products", "Built products.", "", REBUILD),
+    S(APPLE, "Xcode previews", "~/Library/Developer/Xcode/UserData/Previews",
+      "SwiftUI preview build cache.", "rm -rf ~/Library/Developer/Xcode/UserData/Previews"),
+    S(APPLE, "Simulator runtimes", "/Library/Developer/CoreSimulator/Profiles/Runtimes",
+      "System-wide simulator runtimes (one per iOS version). Needs sudo to remove.",
+      "xcrun simctl runtime list   # then: xcrun simctl runtime delete <id>", REVIEW,
+      expand="/Library/Developer/CoreSimulator/Profiles/Runtimes/*"),
+    S(APPLE, "Extra toolchains", "~/Library/Developer/Toolchains",
+      "Swift development snapshots.", "", REVIEW),
+
+    # -------------------------------------------------------------- build & test
+    S(BUILD, "Go build cache", "~/Library/Caches/go-build", "Compiled package objects.",
+      "go clean -cache"),
+    S(BUILD, "Turborepo cache", "~/.cache/turbo", "Shared Turborepo task cache.",
+      "rm -rf ~/.cache/turbo"),
+    S(BUILD, "Nx cache", "~/.cache/nx", "Nx computation cache.", "nx reset"),
+    S(BUILD, "Bazel output", "/private/var/tmp/_bazel_" + os.environ.get("USER", "user"),
+      "Bazel output bases. Frequently the largest thing on a Bazel machine.",
+      "bazel clean --expunge", REBUILD),
+    S(BUILD, "ccache", "~/.cache/ccache", "Compiler output cache.", "ccache -C"),
+    S(BUILD, "ccache (Library)", "~/Library/Caches/ccache", "Compiler output cache.", "ccache -C"),
+    S(BUILD, "sccache", "~/Library/Caches/Mozilla.sccache", "Shared compiler cache.",
+      "sccache --zero-stats && rm -rf ~/Library/Caches/Mozilla.sccache"),
+    S(BUILD, "Playwright browsers", "~/Library/Caches/ms-playwright",
+      "A Chromium, Firefox and WebKit build per Playwright version.",
+      "npx playwright uninstall --all", REBUILD,
+      expand="~/Library/Caches/ms-playwright/*"),
+    S(BUILD, "Puppeteer browsers", "~/.cache/puppeteer", "Chrome builds per version.",
+      "rm -rf ~/.cache/puppeteer", REBUILD),
+    S(BUILD, "Chrome for Testing", "~/.cache/chrome-for-testing", "Pinned Chrome builds.",
+      "rm -rf ~/.cache/chrome-for-testing", REBUILD),
+    S(BUILD, "Cypress binaries", "~/Library/Caches/Cypress", "One Cypress app per version.",
+      "cypress cache prune", REBUILD, expand="~/Library/Caches/Cypress/*"),
+    S(BUILD, "Electron binaries", "~/Library/Caches/electron", "Electron dist zips.",
+      "rm -rf ~/Library/Caches/electron", REBUILD),
+    S(BUILD, "electron-builder", "~/Library/Caches/electron-builder",
+      "Code-signing tools and app images.", "rm -rf ~/Library/Caches/electron-builder", REBUILD),
+    S(BUILD, "pre-commit hooks", "~/.cache/pre-commit", "One environment per hook repo.",
+      "pre-commit clean", REBUILD),
+    S(BUILD, "Terraform plugins", "~/.terraform.d/plugin-cache",
+      "Provider binaries, ~100MB each.", "rm -rf ~/.terraform.d/plugin-cache", REBUILD),
+    S(BUILD, "Vercel CLI cache", "~/Library/Caches/com.vercel.cli", "Build and deploy cache.",
+      "rm -rf ~/Library/Caches/com.vercel.cli"),
+    S(BUILD, "other in ~/.cache", "~/.cache",
+      "Everything in ~/.cache that is not itemised elsewhere here.", "", REVIEW),
+
+    # ---------------------------------------------------------------- models/data
+    S(MODELS, "Ollama models", "~/.ollama/models", "Local LLM weights. Tens of GB is normal.",
+      "ollama list   # then: ollama rm <model>", REVIEW, expand="~/.ollama/models/blobs"),
+    S(MODELS, "Hugging Face hub", "~/.cache/huggingface", "Downloaded models and datasets.",
+      "huggingface-cli delete-cache", REVIEW),
+    S(MODELS, "PyTorch hub", "~/.cache/torch", "Pretrained checkpoints.", "rm -rf ~/.cache/torch",
+      REBUILD),
+    S(MODELS, "LM Studio models", "~/.lmstudio/models", "GGUF weights.", "", REVIEW),
+    S(MODELS, "Kaggle / datasets", "~/.cache/kagglehub", "Downloaded datasets.", "", REVIEW),
+
+    # ------------------------------------------------------------------ app caches
+    S(APPS, "VS Code caches", "~/Library/Application Support/Code/Cache", "Renderer cache.",
+      "rm -rf ~/Library/Application\\ Support/Code/Cache*"),
+    S(APPS, "VS Code CachedData", "~/Library/Application Support/Code/CachedData",
+      "Compiled JS per VS Code version.",
+      "rm -rf ~/Library/Application\\ Support/Code/CachedData"),
+    S(APPS, "VS Code extensions", "~/.vscode/extensions", "Installed extensions.", "", REVIEW),
+    S(APPS, "Cursor caches", "~/Library/Application Support/Cursor/Cache", "Renderer cache.",
+      "rm -rf ~/Library/Application\\ Support/Cursor/Cache*"),
+    S(APPS, "Cursor CachedData", "~/Library/Application Support/Cursor/CachedData",
+      "Compiled JS per version.", "rm -rf ~/Library/Application\\ Support/Cursor/CachedData"),
+    S(APPS, "JetBrains caches", "~/Library/Caches/JetBrains",
+      "Indexes and local history per IDE version.", "", REBUILD,
+      expand="~/Library/Caches/JetBrains/*"),
+    S(APPS, "Zed cache", "~/Library/Caches/dev.zed.Zed", "Editor cache.", ""),
+    S(APPS, "Xcode simulator logs", "~/Library/Logs/CoreSimulator", "Simulator logs.",
+      "rm -rf ~/Library/Logs/CoreSimulator"),
+    S(APPS, "Developer diagnostics", "~/Library/Logs/DiagnosticReports", "Crash reports.",
+      "rm -rf ~/Library/Logs/DiagnosticReports"),
+    S(APPS, "Claude CLI cache", "~/Library/Caches/claude-cli-nodejs", "Session scratch data.", ""),
+]
+
+# ----------------------------------------------------------------- project scan
+
+# Directory names that are always disposable build output.
+ARTIFACTS_STRICT = {
+    "node_modules": "node_modules",
+    ".venv": "python venv",
+    "venv": "python venv",
+    ".tox": "tox",
+    ".mypy_cache": "mypy",
+    ".pytest_cache": "pytest",
+    ".ruff_cache": "ruff",
+    "__pycache__": "pycache",
+    ".next": "next.js",
+    ".nuxt": "nuxt",
+    ".svelte-kit": "svelte-kit",
+    ".angular": "angular",
+    ".astro": "astro",
+    ".turbo": "turbo",
+    ".parcel-cache": "parcel",
+    ".vite": "vite",
+    ".docusaurus": "docusaurus",
+    ".serverless": "serverless",
+    ".terraform": "terraform",
+    ".gradle": "gradle (project)",
+    ".dart_tool": "dart",
+    ".nyc_output": "coverage",
+    "elm-stuff": "elm",
+    "Pods": "cocoapods",
+    "DerivedData": "deriveddata",
+    ".eggs": "python eggs",
+    ".cargo-target": "cargo",
+    ".stack-work": "haskell",
+}
+
+# Names that are only artifacts when a build marker sits beside them. The ones
+# listed as pruned hold huge file counts and are never worth walking into.
+ARTIFACTS_AMBIGUOUS = {
+    "target": "cargo/maven target",
+    "obj": "obj (.net)",
+    "deps": "deps (elixir)",
+    "_build": "build (elixir/ocaml)",
+    "coverage": "coverage",
+    "build": "build",
+    "dist": "dist",
+    "out": "out",
+    "vendor": "vendor",
+}
+
+AMBIGUOUS_PRUNE = {"target", "obj", "deps", "_build", "coverage"}
+
+MARKERS = (
+    "package.json", "Cargo.toml", "go.mod", "pyproject.toml", "setup.py",
+    "pom.xml", "build.gradle", "build.gradle.kts", "CMakeLists.txt", "Makefile",
+    "mix.exs", "pubspec.yaml", "Gemfile", "composer.json", "build.sbt",
+)
+
+ROOT_CANDIDATES = [
+    "~/Code", "~/code", "~/Projects", "~/projects", "~/Developer", "~/dev",
+    "~/src", "~/work", "~/repos", "~/git", "~/workspace", "~/GitHub",
+    "~/Documents/GitHub", "~/Sites", "~/go/src",
+]
+
+
+def dedupe_dirs(paths: list[str]) -> list[str]:
+    """Drop repeats and nested entries. Identity comes from the inode, because
+    ~/Code and ~/code are one directory on a case-insensitive volume."""
+    roots: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for path in paths:
+        p = os.path.realpath(path)
+        if not usable_dir(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            continue
+        if any(p.lower().startswith(r.lower() + os.sep) for r in roots):
+            continue
+        seen.add(key)
+        roots.append(p)
+    return roots
+
+
+def default_roots() -> list[str]:
+    return dedupe_dirs([os.path.expanduser(c) for c in ROOT_CANDIDATES])
+
+
+def has_marker(directory: str) -> bool:
+    try:
+        names = set(os.listdir(directory))
+    except OSError:
+        return False
+    if names & set(MARKERS):
+        return True
+    return any(n.endswith((".csproj", ".xcodeproj", ".sln", ".vcxproj")) for n in names)
+
+
+def find_artifacts(roots: list[str], depth: int = 9) -> list[tuple[str, str]]:
+    """Locate project build artifacts and .git dirs. Returns (path, kind) pairs."""
+    if not roots:
+        return []
+    pruned = sorted(set(ARTIFACTS_STRICT) | AMBIGUOUS_PRUNE | {".git"})
+    walked = sorted(set(ARTIFACTS_AMBIGUOUS) - AMBIGUOUS_PRUNE)
+
+    def names(group):
+        out = []
+        for i, n in enumerate(group):
+            if i:
+                out.append("-o")
+            out += ["-name", n]
+        return out
+
+    cmd = ["find", *roots, "-maxdepth", str(depth), "-type", "d", "("]
+    cmd += ["("] + names(pruned) + [")", "-prune", "-print0"]
+    if walked:
+        cmd += ["-o", "("] + names(walked) + [")", "-print0"]
+    cmd += [")"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=900)
+    except Exception:
+        return []
+
+    found: list[tuple[str, str]] = []
+    for raw in p.stdout.split(b"\0"):
+        if not raw:
+            continue
+        path = os.fsdecode(raw)
+        base = os.path.basename(path)
+        if os.path.islink(path):
+            continue
+        if base == ".git":
+            found.append((path, ".git"))
+        elif base in ARTIFACTS_STRICT:
+            found.append((path, ARTIFACTS_STRICT[base]))
+        elif base in ARTIFACTS_AMBIGUOUS and has_marker(os.path.dirname(path)):
+            found.append((path, ARTIFACTS_AMBIGUOUS[base]))
+    return found
+
+
+def docker_breakdown() -> list[tuple[str, int, str, str, str]]:
+    """Live docker disk usage, when a daemon is reachable."""
+    try:
+        p = subprocess.run(
+            ["docker", "system", "df", "--format", "{{json .}}"],
+            capture_output=True, text=True, timeout=12,
+        )
+    except Exception:
+        return []
+    if p.returncode != 0:
+        return []
+    cmds = {
+        "Images": ("images", "docker image prune -a", REBUILD),
+        "Containers": ("containers", "docker container prune", REVIEW),
+        "Local Volumes": ("volumes", "docker volume prune", REVIEW),
+        "Build Cache": ("build cache", "docker builder prune -a", SAFE),
+    }
+    rows = []
+    for line in p.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        kind = d.get("Type", "")
+        label, cmd, safety = cmds.get(kind, (kind.lower(), "", REVIEW))
+        size = parse_docker_size(d.get("Size", "0"))
+        total = d.get("TotalCount") or d.get("Total") or "?"
+        active = d.get("Active", "")
+        recl = (d.get("Reclaimable") or "").strip()
+        note = f"{total} total"
+        if active not in ("", "0", 0):
+            note += f", {active} in use"
+        if recl:
+            note += f" · {recl} reclaimable"
+        rows.append((label, size, cmd, safety, note))
+    return rows
+
+
+def parse_docker_size(text: str) -> int:
+    text = text.strip()
+    units = {"B": 1, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 12,
+             "KIB": 2 ** 10, "MIB": 2 ** 20, "GIB": 2 ** 30, "TIB": 2 ** 40}
+    num, unit = "", ""
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        elif not ch.isspace():
+            unit += ch
+    try:
+        return int(float(num) * units.get(unit.upper(), 1))
+    except ValueError:
+        return 0
+
+
+# --------------------------------------------------------------------------- #
+# model
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Node:
+    label: str
+    path: str = ""
+    note: str = ""
+    cmd: str = ""
+    safety: str = SAFE
+    kind: str = ""
+    measured: int | None = None     # own du result, if this node maps to a path
+    inner: int = 0                  # bytes already itemised by nested nodes
+    size: int = 0                   # rolled-up display size
+    children: list["Node"] = field(default_factory=list)
+    expanded: bool = False
+    stale: bool = False             # size came from cache, not this scan
+    informational: bool = False     # a view onto bytes counted elsewhere
+    depth: int = 0
+
+    @property
+    def is_leaf(self) -> bool:
+        return not self.children
+
+
+class Model:
+    """The scan result, safe to read from the UI thread while the scan runs."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.categories: list[Node] = []
+        self.total = 0
+        self.count = 0
+        self.done = 0
+        self.pending = 0
+        self.phase = "starting"
+        self.finished = False
+        self.started = time.time()
+        self.elapsed = 0.0
+        self.roots: list[str] = []
+        self.disk = shutil.disk_usage(HOME)
+        self.generation = 0          # bumps whenever the tree changes shape
+
+    # -- tree maintenance ---------------------------------------------------- #
+
+    def recompute(self) -> None:
+        """Subtract nested measurements, roll sizes up, sort by size."""
+        measured = [n for n in self.walk()
+                    if n.measured is not None and not n.informational]
+        for n in measured:
+            n.inner = 0
+        stack: list[Node] = []
+        for n in sorted(measured, key=lambda n: n.path):
+            while stack and not n.path.startswith(stack[-1].path + os.sep):
+                stack.pop()
+            if stack:
+                stack[-1].inner += n.measured or 0
+            stack.append(n)
+
+        def roll(node: Node) -> int:
+            """Sets node.size for display; returns what it adds to its parent."""
+            contributions = [roll(c) for c in node.children]
+            if node.measured is not None:
+                node.size = max(0, node.measured - node.inner)
+            elif node.informational:
+                node.size = sum(c.size for c in node.children)
+            else:
+                node.size = sum(contributions)
+            if node.children:
+                # informational rows last, so real bytes read first
+                node.children.sort(
+                    key=lambda c: (c.informational, -c.size, c.label.lower()))
+            return 0 if node.informational else node.size
+
+        for cat in self.categories:
+            roll(cat)
+        self.categories.sort(key=lambda c: (-c.size, c.label))
+        self.total = sum(c.size for c in self.categories)
+        self.count = sum(1 for n in self.walk()
+                         if n.measured is not None and n.size > 0 and not n.informational)
+
+    def walk(self, nodes: list[Node] | None = None):
+        for n in (self.categories if nodes is None else nodes):
+            yield n
+            if n.children:
+                yield from self.walk(n.children)
+
+    def category(self, name: str) -> Node:
+        for c in self.categories:
+            if c.label == name:
+                return c
+        node = Node(label=name)
+        self.categories.append(node)
+        return node
+
+
+# --------------------------------------------------------------------------- #
+# cache
+# --------------------------------------------------------------------------- #
+
+def load_cache() -> dict:
+    try:
+        with open(CACHE_FILE) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and "sizes" in data:
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_cache(model: Model, found: list[tuple[str, str]]) -> None:
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        sizes = {n.path: n.measured for n in model.walk()
+                 if n.measured is not None and n.path}
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"ts": time.time(), "version": VERSION, "roots": model.roots,
+                       "sizes": sizes, "found": found}, fh)
+        os.replace(tmp, CACHE_FILE)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# scanner
+# --------------------------------------------------------------------------- #
+
+class Scanner:
+    def __init__(self, model: Model, roots: list[str], include_projects: bool = True,
+                 use_cache: bool = True, workers: int = 8) -> None:
+        self.m = model
+        self.roots = roots
+        self.include_projects = include_projects
+        self.use_cache = use_cache
+        self.workers = workers
+        self.cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._guarded, daemon=True)
+        self._thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread:
+            self._thread.join(timeout)
+
+    def _guarded(self) -> None:
+        try:
+            self.run()
+        except Exception as exc:                        # never take the UI down
+            with self.m.lock:
+                self.m.phase = f"scan error: {exc}"
+                self.m.finished = True
+
+    # ----------------------------------------------------------------------- #
+
+    def run(self) -> None:
+        m = self.m
+        cached = load_cache() if self.use_cache else {}
+        cached_sizes: dict = cached.get("sizes", {}) or {}
+
+        # ---- phase 1: the fixed catalog
+        tasks = self._build_catalog(cached_sizes)
+        with m.lock:
+            m.phase = "measuring caches"
+            m.pending = len(tasks)
+            m.recompute()
+            m.generation += 1
+
+        pool = ThreadPoolExecutor(max_workers=self.workers)
+        try:
+            discovery = None
+            if self.include_projects and self.roots:
+                discovery = pool.submit(find_artifacts, self.roots)
+            docker = pool.submit(docker_breakdown)
+
+            self._measure(pool, tasks)
+
+            # ---- phase 2: live docker detail, if a daemon answered
+            rows = []
+            try:
+                rows = docker.result(timeout=20)
+            except Exception:
+                rows = []
+            if rows:
+                with m.lock:
+                    parent = m.category(CONTAINERS)
+                    live = Node(
+                        label="docker · live breakdown",
+                        note="What the running daemon holds. These bytes sit inside the "
+                             "VM disk above, so they are not added to the total.",
+                        kind="docker", safety=REVIEW, informational=True,
+                    )
+                    for label, size, cmd, safety, note in rows:
+                        live.children.append(Node(
+                            label=label, measured=size, size=size, note=note,
+                            cmd=cmd, safety=safety, kind="docker", informational=True))
+                    parent.children.append(live)
+                    m.recompute()
+                    m.generation += 1
+
+            # ---- phase 3: per-project artifacts
+            found: list[tuple[str, str]] = []
+            if discovery is not None:
+                with m.lock:
+                    m.phase = "finding project artifacts"
+                try:
+                    found = discovery.result(timeout=900)
+                except Exception:
+                    found = []
+            elif cached.get("found"):
+                found = [tuple(x) for x in cached["found"]]
+
+            if found:
+                tasks2 = self._build_projects(found, cached_sizes)
+                with m.lock:
+                    m.phase = f"measuring {len(tasks2)} project directories"
+                    m.pending += len(tasks2)
+                    m.recompute()
+                    m.generation += 1
+                self._measure(pool, tasks2)
+        finally:
+            pool.shutdown(wait=False)
+
+        with m.lock:
+            for n in m.walk():
+                n.stale = False
+            m.recompute()
+            m.finished = True
+            m.elapsed = time.time() - m.started
+            m.phase = "done"
+            m.generation += 1
+        save_cache(m, found)
+
+    # ----------------------------------------------------------------------- #
+
+    def _build_catalog(self, cached_sizes: dict) -> list[Node]:
+        m = self.m
+        tasks: list[Node] = []
+        with m.lock:
+            for spec in CATALOG:
+                if not usable_dir(spec.path):
+                    continue
+                node = Node(label=spec.label, path=os.path.normpath(spec.path),
+                            note=spec.note, cmd=spec.cmd, safety=spec.safety,
+                            kind=spec.cat)
+                if node.path in cached_sizes:
+                    node.measured = cached_sizes[node.path]
+                    node.stale = True
+                m.category(spec.cat).children.append(node)
+                tasks.append(node)
+
+                if spec.expand:
+                    for child_path in sorted(glob.glob(spec.expand)):
+                        if not usable_dir(child_path):
+                            continue
+                        child = Node(
+                            label=name_for(child_path, spec.namer),
+                            path=os.path.normpath(child_path),
+                            note=spec.note, cmd=spec.cmd, safety=spec.safety,
+                            kind=spec.cat,
+                        )
+                        if child.path in cached_sizes:
+                            child.measured = cached_sizes[child.path]
+                            child.stale = True
+                        node.children.append(child)
+                        tasks.append(child)
+        return tasks
+
+    def _build_projects(self, found: list[tuple[str, str]], cached_sizes: dict) -> list[Node]:
+        m = self.m
+        tasks: list[Node] = []
+        with m.lock:
+            groups: dict[str, Node] = {}
+            repos = m.category(REPOS)
+            projects = m.category(PROJECTS)
+            for path, kind in found:
+                path = os.path.normpath(path)
+                if kind == ".git":
+                    node = Node(
+                        label=project_label(path, self.roots),
+                        path=path, kind="git",
+                        note="Git object database. Repacking often halves it.",
+                        cmd="git -C <repo> gc --aggressive --prune=now", safety=REVIEW,
+                    )
+                    repos.children.append(node)
+                else:
+                    group = groups.get(kind)
+                    if group is None:
+                        group = Node(label=kind, kind=kind,
+                                     note=ARTIFACT_NOTES.get(kind, "Regenerated by your build."),
+                                     cmd=ARTIFACT_CMDS.get(kind, ""), safety=REBUILD)
+                        groups[kind] = group
+                        projects.children.append(group)
+                    node = Node(
+                        label=project_label(path, self.roots), path=path, kind=kind,
+                        note=group.note, cmd=group.cmd, safety=group.safety,
+                    )
+                    group.children.append(node)
+                if path in cached_sizes:
+                    node.measured = cached_sizes[path]
+                    node.stale = True
+                tasks.append(node)
+        return tasks
+
+    def _measure(self, pool: ThreadPoolExecutor, tasks: list[Node]) -> None:
+        """du the given nodes in parallel batches, publishing results as they land."""
+        m = self.m
+        by_path: dict[str, list[Node]] = {}
+        for n in tasks:
+            by_path.setdefault(n.path, []).append(n)
+        paths = list(by_path)
+        # small batches keep the UI moving; large ones keep du efficient
+        batch = max(8, min(96, len(paths) // (self.workers * 3) or 8))
+        chunks = [paths[i:i + batch] for i in range(0, len(paths), batch)]
+        futures = {pool.submit(du_batch, c): c for c in chunks}
+        for fut in as_completed(futures):
+            if self.cancel.is_set():
+                return
+            try:
+                sizes = fut.result()
+            except Exception:
+                sizes = {}
+            chunk = futures[fut]
+            with m.lock:
+                for p in chunk:
+                    got = sizes.get(p)
+                    for node in by_path.get(p, ()):
+                        node.measured = got if got is not None else (node.measured or 0)
+                        node.stale = False
+                    m.done += 1
+                m.recompute()
+
+
+ARTIFACT_NOTES = {
+    "node_modules": "Dependency trees. `npm ci` / `pnpm i` puts them back.",
+    "python venv": "Virtual environments; recreate from your lockfile.",
+    "cargo/maven target": "Compiled Rust or JVM output. `cargo clean` removes it.",
+    ".git": "Git object database.",
+    "cocoapods": "Installed pods; `pod install` restores them.",
+    "deriveddata": "Xcode build intermediates inside the project.",
+    "terraform": "Provider plugins, re-downloaded by `terraform init`.",
+}
+
+ARTIFACT_CMDS = {
+    "node_modules": "find <root> -name node_modules -maxdepth 4 -prune -exec rm -rf {} +",
+    "cargo/maven target": "cargo clean   # run inside the project",
+    "python venv": "rm -rf <project>/.venv   # then recreate from the lockfile",
+    "gradle (project)": "./gradlew clean",
+    "next.js": "rm -rf <project>/.next",
+    "cocoapods": "rm -rf <project>/Pods   # then: pod install",
+    "deriveddata": "rm -rf <project>/DerivedData",
+}
+
+
+def name_for(path: str, namer: str | None) -> str:
+    base = os.path.basename(path.rstrip("/"))
+    if namer == "simulator":
+        try:
+            with open(os.path.join(path, "device.plist"), "rb") as fh:
+                d = plistlib.load(fh)
+            name = d.get("name") or base
+            runtime = (d.get("runtime") or "").split(".")[-1].replace("-", " ")
+            return f"{name} · {runtime}".strip(" ·")
+        except Exception:
+            return base
+    return base
+
+
+def project_label(path: str, roots: list[str]) -> str:
+    """`repo/sub/path :: kind` trimmed relative to its scan root."""
+    for r in sorted(roots, key=len, reverse=True):
+        if path.startswith(r + os.sep):
+            rel = path[len(r) + 1:]
+            break
+    else:
+        rel = tilde(path)
+    parts = rel.split(os.sep)
+    if len(parts) > 4:
+        parts = parts[:2] + ["…"] + parts[-2:]
+    return os.sep.join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# plain-text output
+# --------------------------------------------------------------------------- #
+
+class Ink:
+    """Minimal ANSI styling that disappears when it should."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.on = enabled
+
+    def _w(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.on else text
+
+    def dim(self, t): return self._w("2", t)
+    def bold(self, t): return self._w("1", t)
+    def head(self, t): return self._w("1;4", t)
+    def accent(self, t): return self._w("36", t)
+    def green(self, t): return self._w("32", t)
+    def yellow(self, t): return self._w("33", t)
+    def red(self, t): return self._w("31", t)
+
+    def magnitude(self, n: int, text: str) -> str:
+        if n >= 10 * 2 ** 30:
+            return self.red(text)
+        if n >= 2 ** 30:
+            return self.yellow(text)
+        if n >= 100 * 2 ** 20:
+            return text
+        return self.dim(text)
+
+    def safety(self, s: str) -> str:
+        return {SAFE: self.green, REBUILD: self.yellow, REVIEW: self.red}.get(s, self.dim)(s)
+
+
+def term_width(default: int = 92) -> int:
+    try:
+        return max(60, min(shutil.get_terminal_size((default, 24)).columns, 120))
+    except Exception:
+        return default
+
+
+def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
+    w = term_width()
+    total, used, free = m.disk
+    pct = used / total if total else 0.0
+
+    p = lambda s="": print(s, file=out)
+    p()
+    tight = ink.red if free < 15 * 2 ** 30 else ink.green
+    p(f" {ink.bold('devspace')}  "
+      f"{ink.dim(f'{human(total)} volume · {human(used)} used · ')}"
+      f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
+    p()
+
+    if not m.categories:
+        p(ink.dim("  nothing found"))
+        return
+
+    biggest = max((c.size for c in m.categories), default=1) or 1
+    labelw = max(len(c.label) for c in m.categories) + 2
+    barw = max(12, min(28, w - labelw - 22))
+    for c in m.categories:
+        if c.size <= 0:
+            continue
+        leaves = sum(1 for n in m.walk([c])
+                     if n.measured is not None and n.size > 0 and not n.informational)
+        p(f"  {c.label.ljust(labelw)}{ink.magnitude(c.size, human(c.size, pad=True))}  "
+          f"{ink.accent(bar(c.size / biggest, barw))} {ink.dim(str(leaves))}")
+    p(f"  {'':{labelw}}{ink.dim('─────')}")
+    share = f"{m.total / used * 100:.0f}% of used space" if used else ""
+    p(f"  {ink.bold('total'.ljust(labelw))}{ink.bold(human(m.total, pad=True))}  {ink.dim(share)}")
+
+    if top:
+        items = sorted(
+            (n for n in m.walk()
+             if n.measured is not None and n.size > 0 and not n.informational),
+            key=lambda n: -n.size,
+        )[:top]
+        p()
+        p(f" {ink.head('largest items')}")
+        p()
+        namew = max((len(n.label) for n in items), default=10)
+        namew = min(namew, max(18, w // 3))
+        for n in items:
+            path = tilde(n.path)
+            room = w - namew - 14
+            p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
+              f"{shorten(n.label, namew).ljust(namew)}  {ink.dim(shorten(path, room))}")
+
+    p()
+    p(f" {ink.dim('devspace -i')} to browse   "
+      f"{ink.dim('devspace --commands')} to print reclaim commands   "
+      f"{ink.dim('devspace --tree')} for everything")
+    p()
+
+
+def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
+    w = term_width()
+    p = lambda s="": print(s, file=out)
+    p()
+    for c in m.categories:
+        if c.size < min_bytes:
+            continue
+        p(f" {ink.head(c.label)}  {ink.bold(human(c.size))}")
+
+        def emit(node: Node, depth: int) -> None:
+            for child in node.children:
+                if child.size < min_bytes and not child.informational:
+                    continue
+                pad = "  " + "  " * depth
+                label = shorten(child.label, max(20, w - len(pad) - 30))
+                p(f"{pad}{ink.magnitude(child.size, human(child.size, pad=True))}  {label}")
+                emit(child, depth + 1)
+
+        emit(c, 1)
+        p()
+
+
+def print_commands(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
+    """Emit the reclaim commands as a commented script. Never runs anything."""
+    p = lambda s="": print(s, file=out)
+    p("#!/bin/sh")
+    p("# Reclaim commands suggested by devspace. NOTHING here has been run.")
+    p("# Read every line before you run it; some are destructive by design.")
+    p(f"# generated {time.strftime('%Y-%m-%d %H:%M')}  ·  {human(m.total)} mapped")
+    seen: set[str] = set()
+    for c in m.categories:
+        rows = []
+        for n in m.walk([c]):
+            if n.cmd and n.size >= min_bytes and n.cmd not in seen:
+                seen.add(n.cmd)
+                rows.append(n)
+        if not rows:
+            continue
+        p()
+        p(f"# ---- {c.label} " + "-" * max(0, 60 - len(c.label)))
+        for n in sorted(rows, key=lambda n: -n.size):
+            p(f"\n# {n.label}  ({human(n.size)}, {n.safety})")
+            if n.note:
+                p(f"#   {n.note}")
+            p(f"# {n.cmd}")
+
+
+def to_json(m: Model) -> dict:
+    def node(n: Node) -> dict:
+        d = {"label": n.label, "bytes": n.size}
+        if n.informational:
+            d["informational"] = True
+        if n.path:
+            d["path"] = n.path
+        if n.kind:
+            d["kind"] = n.kind
+        if n.cmd:
+            d["reclaim"] = n.cmd
+            d["safety"] = n.safety
+        if n.children:
+            d["children"] = [node(c) for c in n.children]
+        return d
+
+    total, used, free = m.disk
+    return {
+        "version": VERSION,
+        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "duration_seconds": round(m.elapsed, 2),
+        "volume": {"total_bytes": total, "used_bytes": used, "free_bytes": free},
+        "mapped_bytes": m.total,
+        "roots": m.roots,
+        "categories": [node(c) for c in m.categories],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# entry point
+# --------------------------------------------------------------------------- #
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        prog="devspace",
+        description="Show where developer tooling hides your disk space. Read-only.",
+        epilog="devspace never deletes, moves or modifies anything.",
+    )
+    ap.add_argument("roots", nargs="*", metavar="DIR",
+                    help="directories to scan for project artifacts "
+                         "(default: ~/Code, ~/Projects, ~/dev, ... if present)")
+    ap.add_argument("-i", "--interactive", "--tui", action="store_true", dest="tui",
+                    help="open the interactive browser")
+    ap.add_argument("-t", "--tree", action="store_true", help="print the full tree")
+    ap.add_argument("-c", "--commands", action="store_true",
+                    help="print the reclaim commands as a shell script (does not run them)")
+    ap.add_argument("-j", "--json", action="store_true", help="print JSON")
+    ap.add_argument("-n", "--top", type=int, default=12, metavar="N",
+                    help="how many largest items to list (default 12, 0 to omit)")
+    ap.add_argument("-m", "--min", default="10M", metavar="SIZE",
+                    help="hide anything smaller, e.g. 50M or 1G (default 10M)")
+    ap.add_argument("--no-projects", action="store_true",
+                    help="skip the per-project artifact scan (much faster)")
+    ap.add_argument("--fresh", action="store_true", help="ignore the cached sizes")
+    ap.add_argument("--no-color", action="store_true", help="disable colour")
+    ap.add_argument("-V", "--version", action="version", version=f"devspace {VERSION}")
+    return ap.parse_args(argv)
+
+
+def parse_size(text: str) -> int:
+    text = text.strip().upper().rstrip("B")
+    mult = 1
+    if text and text[-1] in "KMGT":
+        mult = {"K": 2 ** 10, "M": 2 ** 20, "G": 2 ** 30, "T": 2 ** 40}[text[-1]]
+        text = text[:-1]
+    try:
+        return int(float(text or 0) * mult)
+    except ValueError:
+        return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    roots = (dedupe_dirs([os.path.expanduser(r) for r in args.roots])
+             or default_roots())
+
+    model = Model()
+    model.roots = roots
+    scanner = Scanner(model, roots,
+                      include_projects=not args.no_projects,
+                      use_cache=not args.fresh)
+
+    if args.tui:
+        from_tty = sys.stdout.isatty() and sys.stdin.isatty()
+        if not from_tty:
+            print("devspace: -i needs a terminal", file=sys.stderr)
+            return 2
+        scanner.start()
+        run_tui(model, scanner)
+        return 0
+
+    colour = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
+    ink = Ink(colour)
+    quiet = args.json or args.commands
+
+    scanner.start()
+    spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    i = 0
+    while not model.finished:
+        if not quiet and sys.stderr.isatty():
+            with model.lock:
+                done, pend, phase = model.done, model.pending, model.phase
+            print(f"\r\033[2K {ink.accent(spin[i % len(spin)])} {phase} "
+                  f"{ink.dim(f'{done}/{pend}')}", end="", file=sys.stderr, flush=True)
+        i += 1
+        time.sleep(0.08)
+    if not quiet and sys.stderr.isatty():
+        print("\r\033[2K", end="", file=sys.stderr, flush=True)
+    scanner.join(1)
+
+    min_bytes = parse_size(args.min)
+    with model.lock:
+        if args.json:
+            json.dump(to_json(model), sys.stdout, indent=2)
+            print()
+        elif args.commands:
+            print_commands(model, ink, min_bytes)
+        elif args.tree:
+            print_tree(model, ink, min_bytes)
+        else:
+            print_report(model, ink, max(0, args.top))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# interactive browser
+# --------------------------------------------------------------------------- #
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+HELP = [
+    ("moving", [
+        ("j / ↓", "down"),
+        ("k / ↑", "up"),
+        ("ctrl-d / ctrl-u", "half page"),
+        ("g / G", "first / last"),
+    ]),
+    ("opening", [
+        ("↵  space  tab", "expand or collapse"),
+        ("→ / ←", "expand / collapse"),
+        ("e / E", "expand all / collapse all"),
+    ]),
+    ("finding", [
+        ("/", "filter by name or path"),
+        ("esc", "clear the filter"),
+        ("s", "sort by size or name"),
+        ("a", "show items under 10M"),
+    ]),
+    ("using", [
+        ("c", "copy the reclaim command"),
+        ("y", "copy the path"),
+        ("o", "reveal in Finder"),
+        ("d", "toggle the detail pane"),
+        ("r", "rescan"),
+        ("q", "quit"),
+    ]),
+]
+
+SAFETY_TEXT = {
+    SAFE: "safe — regenerates itself",
+    REBUILD: "rebuild — fine to remove, costs you a rebuild",
+    REVIEW: "review — may hold something you want",
+}
+
+
+class Tui:
+    MIN_SMALL = 10 * 2 ** 20     # hidden unless 'a'
+
+    def __init__(self, stdscr, model: Model, scanner: Scanner) -> None:
+        self.s = stdscr
+        self.m = model
+        self.scanner = scanner
+        self.cursor = 0
+        self.top = 0
+        self.rows: list[tuple[Node, int, int]] = []
+        self.restore: set[str] = set()
+        self.filter = ""
+        self.typing = False
+        self.detail = True
+        self.show_small = False
+        self.sort_by_name = False
+        self.help = False
+        self.message = ""
+        self.message_until = 0.0
+        self.tick = 0
+
+    # -- curses plumbing ----------------------------------------------------- #
+
+    def setup(self) -> None:
+        curses.curs_set(0)
+        self.s.nodelay(True)
+        self.s.keypad(True)
+        self.colour = False
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            for i, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_RED,
+                                    curses.COLOR_YELLOW, curses.COLOR_GREEN), start=1):
+                curses.init_pair(i, fg, -1)
+            self.colour = True
+        except Exception:
+            self.colour = False
+        self.ACCENT = curses.color_pair(1) if self.colour else curses.A_BOLD
+        self.RED = curses.color_pair(2) if self.colour else curses.A_NORMAL
+        self.YELLOW = curses.color_pair(3) if self.colour else curses.A_NORMAL
+        self.GREEN = curses.color_pair(4) if self.colour else curses.A_NORMAL
+        self.DIM = curses.A_DIM
+
+    def put(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = self.s.getmaxyx()
+        if y < 0 or y >= h or x >= w or not text:
+            return
+        try:
+            self.s.addnstr(y, x, text, max(0, w - x - 1), attr)
+        except curses.error:
+            pass
+
+    def magnitude(self, n: int) -> int:
+        if n >= 10 * 2 ** 30:
+            return self.RED
+        if n >= 2 ** 30:
+            return self.YELLOW
+        if n >= 100 * 2 ** 20:
+            return curses.A_NORMAL
+        return self.DIM
+
+    def note(self, text: str, seconds: float = 2.0) -> None:
+        self.message = text
+        self.message_until = time.time() + seconds
+
+    # -- the visible row list ------------------------------------------------ #
+
+    def build_rows(self) -> None:
+        filt = self.filter.lower()
+        cache: dict[int, bool] = {}
+
+        def hit(node: Node) -> bool:
+            if not filt:
+                return True
+            key = id(node)
+            if key in cache:
+                return cache[key]
+            own = filt in node.label.lower() or filt in tilde(node.path).lower()
+            res = own or any(hit(c) for c in node.children)
+            cache[key] = res
+            return res
+
+        def visible(node: Node) -> bool:
+            if not hit(node):
+                return False
+            if node.size <= 0 and not node.children:
+                return False
+            return self.show_small or filt or node.size >= self.MIN_SMALL
+
+        rows: list[tuple[Node, int, int]] = []
+
+        def order(kids: list[Node]) -> list[Node]:
+            if self.sort_by_name:
+                return sorted(kids, key=lambda n: n.label.lower())
+            return kids
+
+        def emit(node: Node, depth: int, peak: int) -> None:
+            rows.append((node, depth, peak))
+            if node.children and (node.expanded or filt):
+                inner_peak = max((c.size for c in node.children), default=1) or 1
+                for child in order(node.children):
+                    if visible(child):
+                        emit(child, depth + 1, inner_peak)
+
+        top_peak = max((c.size for c in self.m.categories), default=1) or 1
+        for cat in order(self.m.categories):
+            if cat.size <= 0 and not cat.children:
+                continue
+            if not hit(cat):
+                continue
+            emit(cat, 0, top_peak)
+        self.rows = rows
+        self.cursor = max(0, min(self.cursor, len(rows) - 1))
+
+    # -- layout -------------------------------------------------------------- #
+
+    def geometry(self):
+        h, w = self.s.getmaxyx()
+        head = 5
+        foot = 1
+        detail = 6 if self.detail and h >= 20 else 0
+        body = max(1, h - head - foot - detail)
+        return h, w, head, body, detail, foot
+
+    def draw(self) -> None:
+        self.s.erase()
+        h, w, head, body, detail, foot = self.geometry()
+        with self.m.lock:
+            if self.restore:
+                for n in self.m.walk():
+                    if n.path in self.restore and n.children:
+                        n.expanded = True
+                if self.m.finished:
+                    self.restore = set()
+            self.build_rows()
+            self.draw_header(w)
+            self.draw_body(head, body, w)
+            if detail:
+                self.draw_detail(head + body, detail, w)
+        self.draw_footer(h - 1, w)
+        if self.help:
+            self.draw_help(h, w)
+        self.s.noutrefresh()
+        curses.doupdate()
+
+    def draw_header(self, w: int) -> None:
+        m = self.m
+        total, used, free = m.disk
+        pct = used / total if total else 0.0
+        self.put(0, 1, "devspace", curses.A_BOLD)
+        if m.finished:
+            right = f"{m.count} locations · {m.elapsed:.1f}s"
+            attr = self.DIM
+        else:
+            right = (f"{SPINNER[self.tick % len(SPINNER)]} {m.phase} "
+                     f"{m.done}/{max(m.pending, 1)}")
+            attr = self.ACCENT
+        self.put(0, max(11, w - len(right) - 2), right, attr)
+        self.put(1, 1, "─" * max(0, w - 2), self.DIM)
+
+        low = free < 15 * 2 ** 30
+        self.put(2, 1, "volume", self.DIM)
+        lead = f"{human(total)} · {human(used)} used · "
+        free_text = f"{human(free)} free"
+        self.put(2, 9, lead)
+        x = 9 + len(lead)
+        self.put(2, x, free_text, self.RED if low else self.GREEN)
+        x += len(free_text) + 2
+        # size the bar from what is actually left, so the percentage never clips
+        pct_text = f"{pct * 100:.0f}%"
+        bw = min(24, w - 2 - x - len(pct_text) - 1)
+        if bw >= 6:
+            self.put(2, x, bar(pct, bw), self.RED if low else self.ACCENT)
+            self.put(2, x + bw + 1, pct_text, self.DIM)
+        elif x + len(pct_text) < w - 1:
+            self.put(2, x, pct_text, self.DIM)
+
+        share = f"{m.total / used * 100:.0f}% of used space" if used else ""
+        self.put(3, 1, "mapped", self.DIM)
+        self.put(3, 9, human(m.total), curses.A_BOLD | self.magnitude(m.total))
+        self.put(3, 9 + len(human(m.total)) + 2, share, self.DIM)
+        if self.filter:
+            tag = f"filter: {self.filter}" + ("█" if self.typing else "")
+            self.put(3, max(40, w - len(tag) - 2), tag, self.ACCENT)
+        self.put(4, 1, "─" * max(0, w - 2), self.DIM)
+
+    def draw_body(self, y0: int, body: int, w: int) -> None:
+        if not self.rows:
+            self.put(y0 + 1, 3, "no matches" if self.filter else "scanning…", self.DIM)
+            return
+        if self.cursor < self.top:
+            self.top = self.cursor
+        if self.cursor >= self.top + body:
+            self.top = self.cursor - body + 1
+        self.top = max(0, min(self.top, max(0, len(self.rows) - body)))
+
+        bw = max(8, min(22, w // 5))
+        sizew = 6
+        namespace = w - 3 - sizew - bw - 2
+        pathw = 0
+        if namespace > 54:
+            pathw = min(38, namespace // 3)
+        labelw = namespace - pathw - (2 if pathw else 0)
+
+        for i in range(body):
+            idx = self.top + i
+            if idx >= len(self.rows):
+                break
+            node, depth, peak = self.rows[idx]
+            y = y0 + i
+            selected = idx == self.cursor
+            indent = "  " * depth
+            if node.children:
+                glyph = "▾ " if (node.expanded or self.filter) else "▸ "
+            else:
+                glyph = "  "
+            label = node.label if depth else node.label.upper()
+            text = shorten(indent + glyph + label, labelw)
+
+            frac = node.size / peak if peak else 0.0
+
+            if selected:
+                self.put(y, 0, " " * (w - 1), curses.A_REVERSE)
+                self.put(y, 1, text, curses.A_REVERSE)
+                if pathw and node.path:
+                    self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw),
+                             curses.A_REVERSE)
+                self.put(y, w - sizew - bw - 2, human(node.size, pad=True), curses.A_REVERSE)
+                self.put(y, w - bw - 1, bar(frac, bw), curses.A_REVERSE)
+                continue
+
+            attr = curses.A_BOLD if depth == 0 else curses.A_NORMAL
+            if node.stale:
+                attr |= self.DIM
+            self.put(y, 1, text, attr)
+            if pathw and node.path:
+                self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw), self.DIM)
+            self.put(y, w - sizew - bw - 2, human(node.size, pad=True),
+                     self.magnitude(node.size))
+            self.put(y, w - bw - 1, bar(frac, bw),
+                     self.ACCENT if depth == 0 else self.DIM)
+
+    def parent_of(self, target: Node) -> Node | None:
+        stack = list(self.m.categories)
+        while stack:
+            n = stack.pop()
+            for c in n.children:
+                if c is target:
+                    return n
+                stack.append(c)
+        return None
+
+    def draw_detail(self, y0: int, height: int, w: int) -> None:
+        self.put(y0, 1, "─" * max(0, w - 2), self.DIM)
+        if not self.rows:
+            return
+        node = self.rows[self.cursor][0]
+        size = human(node.size)
+        self.put(y0 + 1, 1, shorten(node.label, w - len(size) - 6), curses.A_BOLD)
+        self.put(y0 + 1, w - len(size) - 2, size, curses.A_BOLD | self.magnitude(node.size))
+
+        if node.path:
+            self.put(y0 + 2, 1, shorten(node.path, w - 3), self.DIM)
+        elif node.children:
+            biggest = max(node.children, key=lambda c: c.size)
+            leaves = sum(1 for n in self.m.walk([node])
+                         if n.measured is not None and not n.informational)
+            summary = (f"{leaves} location{'s' if leaves != 1 else ''} · "
+                       f"largest is {biggest.label} at {human(biggest.size)}")
+            self.put(y0 + 2, 1, shorten(summary, w - 3), self.DIM)
+
+        if node.note:
+            self.put(y0 + 3, 1, shorten(node.note, w - 3))
+        if node.cmd:
+            self.put(y0 + 4, 1, "reclaim", self.DIM)
+            self.put(y0 + 4, 9, shorten(node.cmd, w - 12), self.ACCENT)
+        elif node.path:
+            self.put(y0 + 4, 1, "reclaim", self.DIM)
+            self.put(y0 + 4, 9, "no single command — inspect it first", self.DIM)
+
+        if height >= 6:
+            # a grouping row is not a thing you can delete, so it gets no rating
+            if node.cmd or node.path:
+                col = {SAFE: self.GREEN, REBUILD: self.YELLOW,
+                       REVIEW: self.RED}.get(node.safety, self.DIM)
+                self.put(y0 + 5, 1, "safety", self.DIM)
+                self.put(y0 + 5, 9, SAFETY_TEXT.get(node.safety, node.safety), col)
+            if node.informational:
+                self.put(y0 + 5, 1, "counted", self.DIM)
+                self.put(y0 + 5, 9, "inside the entry above, not added to the total",
+                         self.DIM)
+            hint = "c copy command · y copy path"
+            if w > 78:
+                self.put(y0 + 5, w - len(hint) - 2, hint, self.DIM)
+
+    def draw_footer(self, y: int, w: int) -> None:
+        if time.time() < self.message_until:
+            self.put(y, 1, self.message, self.ACCENT | curses.A_BOLD)
+            return
+        if self.typing:
+            self.put(y, 1, f"/{self.filter}█   "
+                           f"↵ keep · esc clear", self.ACCENT)
+            return
+        full = ("j/k move   ↵ open   e/E expand   / filter   s sort   "
+                "d detail   r rescan   ? keys   q quit")
+        short = "j/k  ↵ open  / filter  ? keys  q quit"
+        self.put(y, 1, full if w > len(full) + 3 else short, self.DIM)
+
+    def draw_help(self, h: int, w: int) -> None:
+        lines: list[tuple[str, str]] = []
+        for section, keys in HELP:
+            lines.append((section, ""))
+            lines.extend(keys)
+            lines.append(("", ""))
+        lines.pop()
+        bw = min(w - 6, 58)
+        bh = min(h - 4, len(lines) + 4)
+        y0 = (h - bh) // 2
+        x0 = (w - bw) // 2
+        for i in range(bh):
+            self.put(y0 + i, x0, " " * bw, curses.A_REVERSE)
+        self.put(y0 + 1, x0 + 2, "devspace — keys", curses.A_REVERSE | curses.A_BOLD)
+        for i, (left, right) in enumerate(lines[: bh - 4]):
+            y = y0 + 3 + i
+            if not right:
+                self.put(y, x0 + 2, left, curses.A_REVERSE | curses.A_BOLD)
+            else:
+                self.put(y, x0 + 3, left.ljust(18), curses.A_REVERSE)
+                self.put(y, x0 + 22, right, curses.A_REVERSE)
+        tail = "any key to close"
+        self.put(y0 + bh - 1, x0 + bw - len(tail) - 2, tail, curses.A_REVERSE)
+
+    # -- input --------------------------------------------------------------- #
+
+    def current(self) -> Node | None:
+        return self.rows[self.cursor][0] if self.rows else None
+
+    def move(self, delta: int) -> None:
+        if self.rows:
+            self.cursor = max(0, min(len(self.rows) - 1, self.cursor + delta))
+
+    def set_expanded(self, nodes: list[Node], value: bool) -> None:
+        for n in nodes:
+            if n.children:
+                n.expanded = value
+                self.set_expanded(n.children, value)
+
+    def handle(self, ch: int) -> bool:
+        """Returns False to quit."""
+        h, w, head, body, detail, foot = self.geometry()
+
+        if self.help:
+            self.help = False
+            return True
+
+        if self.typing:
+            if ch in (10, 13, curses.KEY_ENTER):
+                self.typing = False
+            elif ch == 27:
+                self.typing, self.filter = False, ""
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.filter = self.filter[:-1]
+            elif 32 <= ch < 127:
+                self.filter += chr(ch)
+            return True
+
+        node = self.current()
+        if ch in (ord("q"), 27):
+            return False
+        if ch in (ord("j"), curses.KEY_DOWN):
+            self.move(1)
+        elif ch in (ord("k"), curses.KEY_UP):
+            self.move(-1)
+        elif ch == 4:                                   # ctrl-d
+            self.move(body // 2)
+        elif ch == 21:                                  # ctrl-u
+            self.move(-body // 2)
+        elif ch == curses.KEY_NPAGE:
+            self.move(body)
+        elif ch == curses.KEY_PPAGE:
+            self.move(-body)
+        elif ch in (ord("g"), curses.KEY_HOME):
+            self.cursor, self.top = 0, 0
+        elif ch in (ord("G"), curses.KEY_END):
+            self.cursor = max(0, len(self.rows) - 1)
+        elif ch in (10, 13, curses.KEY_ENTER, ord(" "), 9, curses.KEY_RIGHT):
+            if node and node.children:
+                node.expanded = not node.expanded
+        elif ch == curses.KEY_LEFT:
+            if node and node.children and node.expanded:
+                node.expanded = False
+            elif node:
+                with self.m.lock:
+                    parent = self.parent_of(node)
+                if parent:
+                    for i, row in enumerate(self.rows):
+                        if row[0] is parent:
+                            self.cursor = i
+                            break
+        elif ch == ord("e"):
+            with self.m.lock:
+                self.set_expanded(self.m.categories, True)
+        elif ch == ord("E"):
+            with self.m.lock:
+                self.set_expanded(self.m.categories, False)
+            self.cursor = 0
+        elif ch == ord("/"):
+            self.typing = True
+        elif ch == ord("s"):
+            self.sort_by_name = not self.sort_by_name
+            self.note("sorted by " + ("name" if self.sort_by_name else "size"))
+        elif ch == ord("a"):
+            self.show_small = not self.show_small
+            self.note("showing everything" if self.show_small else "hiding items under 10M")
+        elif ch == ord("d"):
+            self.detail = not self.detail
+        elif ch == ord("?"):
+            self.help = True
+        elif ch == ord("c") and node:
+            if node.cmd:
+                self.note("copied command" if clip(node.cmd) else "could not copy")
+            else:
+                self.note("no command for this item")
+        elif ch == ord("y") and node:
+            if node.path:
+                self.note("copied path" if clip(node.path) else "could not copy")
+            else:
+                self.note("no path for this item")
+        elif ch == ord("o") and node and node.path:
+            try:
+                subprocess.Popen(["open", "-R", node.path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.note("revealed in Finder")
+            except Exception:
+                self.note("could not open Finder")
+        elif ch == ord("r"):
+            self.rescan()
+        elif ch == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def rescan(self) -> None:
+        if not self.m.finished:
+            self.note("already scanning")
+            return
+        expanded = {n.path for n in self.m.walk() if n.expanded and n.path}
+        with self.m.lock:
+            self.m.categories = []
+            self.m.total = self.m.done = self.m.pending = self.m.count = 0
+            self.m.finished = False
+            self.m.started = time.time()
+            self.m.phase = "rescanning"
+            self.m.disk = shutil.disk_usage(HOME)
+        self.scanner = Scanner(self.m, self.m.roots,
+                               include_projects=self.scanner.include_projects,
+                               use_cache=False)
+        self.scanner.start()
+        self.restore = expanded
+        self.note("rescanning")
+
+    def loop(self) -> None:
+        self.setup()
+        while True:
+            self.draw()
+            self.tick += 1
+            ch = -1
+            deadline = time.time() + 0.12
+            while time.time() < deadline:
+                ch = self.s.getch()
+                if ch != -1:
+                    break
+                time.sleep(0.01)
+            if ch != -1 and not self.handle(ch):
+                return
+
+
+def run_tui(model: Model, scanner: Scanner) -> None:
+    def inner(stdscr):
+        Tui(stdscr, model, scanner).loop()
+
+    try:
+        curses.wrapper(inner)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
