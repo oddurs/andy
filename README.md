@@ -1,6 +1,7 @@
 # andy
 
-A read-only accounting of where developer tooling hides your disk space, on macOS.
+A read-only accounting of where developer tooling hides your disk space, on
+macOS and Linux.
 
 Container disk images, package manager caches, language toolchains, Xcode
 leftovers, simulator disks, model weights and per-project build output — found,
@@ -36,7 +37,8 @@ running them is your decision.
 
 ## Install
 
-One file, Python 3.9+, no dependencies. `curses` and `du` ship with macOS.
+One file, Python 3.9+, no dependencies. `curses` and `du` are already there on
+macOS and on any Linux with coreutils.
 
 ```sh
 curl -o /usr/local/bin/andy \
@@ -69,8 +71,9 @@ your terminal's own text selection alone.
 
 ### The interactive browser
 
-`andy -i` opens a tree you can walk. Sizes stream in as they are measured,
-so it is usable before the scan finishes.
+`andy -i` opens a tree you can walk. Sizes stream in as they are counted — each
+one climbing as `du` reports the directories underneath it — so it is usable
+well before the scan finishes.
 
 ```
  ▾ PROJECT ARTIFACTS                                                        36.9G  ████████████████████
@@ -139,28 +142,43 @@ the mouse alone entirely.
 
 ## What it looks at
 
-Roughly 100 known locations, and only those that exist on your machine:
+Around 160 known locations, and only those that exist on your machine:
 
 - **Containers and VMs** — OrbStack, Docker Desktop, Colima, Lima, Podman,
   Rancher Desktop, minikube, Vagrant, UTM, VirtualBox, Parallels. When a Docker
   daemon is reachable it also shows the live image / volume / build-cache split.
 - **Package caches** — npm, npx, pnpm, Yarn, Bun, Deno, Cargo, Go modules, pip,
-  uv, Poetry, Maven, Gradle, CocoaPods, Carthage, SwiftPM, Homebrew, RubyGems,
-  Composer, NuGet, pub, Stack, Cabal, opam, Hex, Conan, vcpkg, conda.
-- **Toolchains and runtimes** — rustup, nvm, fnm, Volta, pyenv, rbenv, asdf,
-  mise, SDKMAN, local JDKs, ghcup, .NET, Android SDK and emulators, Flutter.
+  uv, Poetry, pipenv, Maven, Gradle, Ivy, sbt, Coursier, CocoaPods, Carthage,
+  SwiftPM, Homebrew, RubyGems, cpanm, Composer, NuGet, pub, Stack, Cabal, opam,
+  Hex, rebar3, Conan, vcpkg, conda, Julia.
+- **Toolchains and runtimes** — rustup, nvm, fnm, nodenv, Volta, pyenv, rbenv,
+  jenv, tfenv, asdf, mise, SDKMAN, local JDKs, Go SDKs, ghcup, .NET, Bun,
+  Android SDK and emulators, Flutter, Nix, PlatformIO, ESP-IDF, Emscripten,
+  Unity, Unreal, Godot.
 - **Xcode and simulators** — DerivedData, simulator devices (named, not just
-  UDIDs), simulator runtimes and caches, device support, archives, previews.
+  UDIDs), simulator runtimes, volumes and caches, iOS/watchOS/tvOS/macOS device
+  support, XCTest devices, archives, previews, Xcode's own cache.
 - **Build and test caches** — Go build cache, Turborepo, Nx, Bazel, ccache,
-  sccache, Playwright, Puppeteer, Cypress, Electron, pre-commit, Terraform.
-- **Models and datasets** — Ollama, Hugging Face, PyTorch hub, LM Studio.
+  sccache, Zig, Triton, node-gyp, electron-gyp, TypeScript, Selenium,
+  Playwright, Puppeteer, Cypress, Electron, pre-commit, Terraform.
+- **Models and datasets** — Ollama, Hugging Face, PyTorch hub, Whisper, Keras,
+  LM Studio, GPT4All, llama.cpp, Kaggle.
+- **Editors** — VS Code, Cursor, Windsurf and Zed caches, cached data, extension
+  archives and workspace state; JetBrains and Android Studio indexes.
 - **Project artifacts** — `node_modules`, `target`, `.venv`, `.next`, `Pods`,
-  `.gradle`, `.terraform` and similar, found under `~/Code`, `~/Projects`,
-  `~/dev` and the other usual roots, grouped by kind.
+  `.gradle`, `.terraform`, `.wrangler`, `.expo`, `storybook-static`,
+  `cmake-build-*`, `.idea` and about forty others, found under `~/Code`,
+  `~/Projects`, `~/dev` and the other usual roots, grouped by kind.
 - **Git repositories** — object databases, largest first.
+
+A name alone is never enough to call something disposable. `target` and `build`
+only count as build output when a manifest sits beside them; a `.cache` in a
+project with no `package.json` is somebody's data, not a cache.
 
 Every item carries a safety rating: **safe** regenerates itself, **rebuild** is
 fine to remove but costs you a rebuild, **review** may hold something you want.
+Editor state, vendored dependencies and anything holding model weights are
+never rated safe, whatever their name suggests.
 
 ## Notes
 
@@ -170,25 +188,67 @@ own and `other in ~/.cache` holds only the remainder. Docker's live breakdown is
 shown but marked as a view onto the VM disk it lives in, never added to the
 total, because those are the same bytes.
 
-**The first run is slow.** It is `du` walking real trees with a cold filesystem
-cache; expect a minute or two if you have a large container disk. Results are
-cached in `~/.cache/andy/scan.json`, so later runs start from the previous
+**The first run is slow, but nothing waits for the end.** It is `du` walking real
+trees with a cold filesystem cache; expect a minute or two if you have a large
+container disk. andy runs one `du` per location and reads its output as it
+arrives rather than waiting for a total, so every figure climbs while the scan
+is still going and the tree is worth looking at from the first second. Results
+are cached in `~/.cache/andy/scan.json`, so later runs start from the previous
 numbers and refresh in seconds. `--fresh` skips the cache.
 
 **Nothing is allowed to hang.** `du` on the data directory of a *running*
 container VM can block on I/O for many minutes at no CPU at all, and a network
-mount can do the same. Every measurement is therefore bounded: whatever finished
-is kept, stragglers get one more try alone, and anything still unfinished is
-reported as not measured rather than silently counted as zero - with the previous
-scan's figure shown if there is one. `du -x` also keeps the walk on one
+mount can do the same. The measurement phase is bounded, and because the totals
+are already climbing, running out of time costs precision rather than the
+answer: what had been counted is shown as a floor — `≥ 20.1G` — and marked
+incomplete, instead of being discarded. Any `du` still running when andy stops
+is killed rather than orphaned onto that disk. `du -x` keeps every walk on one
 filesystem, so a mounted share is never counted as local disk.
+
+**`--walk` measures without `du`.** The same numbers from a different route:
+andy walks the trees itself, counting `st_blocks` exactly as `du -k` does, with
+the same rules about filesystem boundaries, symlinks and hard links. It is about
+twice as slow — the per-file work `du` does in C is work Python threads have to
+take turns at — so it is not the default, but it is there for a machine where
+spawning a few hundred short-lived processes is unwelcome, or where `du` behaves
+unlike the two implementations this was tested against.
 
 **`~/Code` and `~/code` are one directory** on a case-insensitive volume. Roots
 are de-duplicated by inode, not by spelling, so nothing is counted twice.
 
+**Linux keeps the same things somewhere else.** The catalog is split: the
+portable half — `~/.cache`, `~/.cargo`, `~/.rustup`, `~/.npm`, `~/go`, `/nix`
+and the rest — is shared, and each platform adds its own. `~/Library/...` and
+everything Xcode is tagged macOS-only; `~/.config`, `~/.local/share` and the XDG
+caches are tagged Linux. Clipboard is `pbcopy`, or `wl-copy` / `xclip` / `xsel`,
+whichever answers first; `o` opens the containing directory through `xdg-open`.
+
+Docker differs in kind rather than in path. On macOS the daemon lives in a VM
+whose disk andy measures directly, so `docker system df` describes the same
+bytes and is shown but never added. On Linux there is no VM: `/var/lib/docker`
+is the real thing, reading it needs root, and the daemon's own report is the
+only figure available without privileges — so on Linux it counts toward the
+total, and `/var/lib/docker` is deliberately absent from the catalog.
+
 **Totals are smaller than "used".** andy maps developer storage, not your
 whole disk — photos, mail, iOS backups and system data are deliberately out of
 scope.
+
+## Development
+
+The roadmap and the open issues live in the repository, as Markdown under
+`cairn/items`, rendered to `ROADMAP.md`.
+
+```sh
+python3 -m unittest discover -s tests     # the whole suite
+python3 -m unittest discover -s tests -v  # one line per test
+```
+
+The tests need nothing installed. andy is a zero-dependency program, and a test
+suite you have to `pip install` something to run is a test suite that stops
+telling you whether that is still true — so it is stdlib `unittest`, and
+`tests/andymod.py` does the one awkward thing, importing an executable that has
+no `.py` on the end of it.
 
 ## License
 
