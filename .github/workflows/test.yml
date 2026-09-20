@@ -45,6 +45,11 @@ jobs:
           # would otherwise leave under ~/.cache for the second one to measure.
           fresh_home() { export HOME="$(mktemp -d)"; export XDG_CACHE_HOME="$HOME/.cache"; }
 
+          # The runners have a docker daemon with images loaded, and on Linux
+          # andy counts what it reports. Point docker at nothing so these
+          # assertions are about the tree above and not about the runner.
+          export DOCKER_HOST=unix:///nonexistent/andy-ci.sock
+
           fresh_home
           python andy --json --fresh "$root" > out.json
           python - <<'PY'

@@ -97,7 +97,11 @@ class Scan(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "svc", ".git"), exist_ok=True)
         fill(os.path.join(self.root, "svc", ".git", "pack.bin"), 2)
 
-        patches = mock.patch.multiple(andy, CATALOG=[])
+        # CATALOG out, and the docker daemon with it. On Linux andy counts what
+        # `docker system df` reports -- there is no VM disk there for it to
+        # duplicate -- so on any machine with a running daemon this scan would
+        # otherwise pick up its images and measure the runner, not the tree.
+        patches = mock.patch.multiple(andy, CATALOG=[], docker_breakdown=lambda: [])
         patches.start()
         self.addCleanup(patches.stop)
 
@@ -146,6 +150,35 @@ class Scan(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, "svc", "target", "debug.bin")))
 
 
+class LiveDocker(unittest.TestCase):
+    """What a running daemon contributes, which differs by platform.
+
+    On macOS the daemon lives in a VM whose disk andy measures directly, so its
+    own report is the same bytes seen from inside. On Linux there is no VM.
+    A scan of one directory still reports it either way -- the catalog is about
+    the machine, not about the roots -- and CI found this the hard way, on a
+    runner that had images loaded."""
+
+    ROWS = [("images", 1892595200, "docker image prune -a", andy.REBUILD, "9 total")]
+
+    def scan(self):
+        model = andy.Model()
+        scanner = andy.Scanner(model, [], include_projects=False, use_cache=False)
+        with mock.patch.object(andy, "CATALOG", []), \
+             mock.patch.object(andy, "docker_breakdown", lambda: self.ROWS):
+            scanner.start()
+            scanner.join(60)
+        self.assertTrue(model.finished, model.phase)
+        return model
+
+    def test_the_daemons_figures_are_counted_only_where_they_are_not_a_duplicate(self):
+        total = self.scan().total
+        if andy.MACOS:
+            self.assertEqual(total, 0, "the VM disk was counted twice")
+        else:
+            self.assertEqual(total, 1892595200, "the only figure available was dropped")
+
+
 class EndToEnd(unittest.TestCase):
     """The installed program, as a user runs it.
 
@@ -166,6 +199,9 @@ class EndToEnd(unittest.TestCase):
         env = dict(os.environ,
                    HOME=self.home,
                    XDG_CACHE_HOME=os.path.join(self.dir, "cache"),
+                   # point docker at nothing, so the run describes the tree below
+                   # and not whatever the machine happens to have running
+                   DOCKER_HOST="unix:///nonexistent/andy-test.sock",
                    NO_COLOR="1")
         return subprocess.run([sys.executable, ANDY, *args, self.project],
                               capture_output=True, text=True, timeout=180, env=env)
