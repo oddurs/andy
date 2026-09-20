@@ -1,4 +1,4 @@
-# devspace
+# andy
 
 A read-only accounting of where developer tooling hides your disk space, on macOS.
 
@@ -6,11 +6,11 @@ Container disk images, package manager caches, language toolchains, Xcode
 leftovers, simulator disks, model weights and per-project build output — found,
 measured and ranked, with the command that would reclaim each one.
 
-`devspace` never deletes, moves or modifies anything. It shows you the commands;
+`andy` never deletes, moves or modifies anything. It shows you the commands;
 running them is your decision.
 
 ```
- devspace  228G volume · 218G used · 10.0G free  █████████████████▎ 96%
+ andy  228G volume · 218G used · 10.0G free  █████████████████▎ 96%
 
   project artifacts      36.8G  ████████████████████████████ 221
   containers & vms       29.4G  ██████████████████████▍      3
@@ -39,27 +39,27 @@ running them is your decision.
 One file, Python 3.9+, no dependencies. `curses` and `du` ship with macOS.
 
 ```sh
-curl -o /usr/local/bin/devspace \
-  https://raw.githubusercontent.com/oddurs/devspace/main/devspace
-chmod +x /usr/local/bin/devspace
+curl -o /usr/local/bin/andy \
+  https://raw.githubusercontent.com/oddurs/andy/main/andy
+chmod +x /usr/local/bin/andy
 ```
 
 Or clone and symlink it wherever you keep things:
 
 ```sh
-git clone https://github.com/oddurs/devspace.git
-ln -s "$PWD/devspace/devspace" ~/.local/bin/devspace
+git clone https://github.com/oddurs/andy.git
+ln -s "$PWD/andy/andy" ~/.local/bin/andy
 ```
 
 ## Use
 
 ```sh
-devspace                  # the ranked summary above
-devspace -i               # browse it interactively
-devspace --tree           # every location, grouped
-devspace --commands       # reclaim commands as a commented shell script
-devspace --json           # machine-readable, for scripts and dashboards
-devspace ~/work ~/src     # scan these project roots instead of the defaults
+andy                  # the ranked summary above
+andy -i               # browse it interactively
+andy --tree           # every location, grouped
+andy --commands       # reclaim commands as a commented shell script
+andy --json           # machine-readable, for scripts and dashboards
+andy ~/work ~/src     # scan these project roots instead of the defaults
 ```
 
 Useful flags: `-n N` how many largest items to list, `-m SIZE` hide anything
@@ -68,7 +68,7 @@ just want the caches, `--fresh` to ignore cached sizes.
 
 ### The interactive browser
 
-`devspace -i` opens a tree you can walk. Sizes stream in as they are measured,
+`andy -i` opens a tree you can walk. Sizes stream in as they are measured,
 so it is usable before the scan finishes.
 
 ```
@@ -130,13 +130,13 @@ total, because those are the same bytes.
 
 **The first run is slow.** It is `du` walking real trees with a cold filesystem
 cache; expect a minute or two if you have a large container disk. Results are
-cached in `~/.cache/devspace/scan.json`, so later runs start from the previous
+cached in `~/.cache/andy/scan.json`, so later runs start from the previous
 numbers and refresh in seconds. `--fresh` skips the cache.
 
 **`~/Code` and `~/code` are one directory** on a case-insensitive volume. Roots
 are de-duplicated by inode, not by spelling, so nothing is counted twice.
 
-**Totals are smaller than "used".** devspace maps developer storage, not your
+**Totals are smaller than "used".** andy maps developer storage, not your
 whole disk — photos, mail, iOS backups and system data are deliberately out of
 scope.
 

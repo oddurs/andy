@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-devspace — a read-only TUI that shows where developer tooling hides your disk.
+andy — a read-only TUI that shows where developer tooling hides your disk.
 
 Containers and VM images, package manager caches, toolchains, build caches,
 Xcode junk, model weights and per-project artifacts, measured and ranked.
 
-Nothing is ever deleted, moved or modified. For each item devspace shows the
+Nothing is ever deleted, moved or modified. For each item andy shows the
 command that would reclaim it, and can copy that command to your clipboard --
 running it is your call.
 """
@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 HOME = os.path.expanduser("~")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "devspace")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "andy")
 CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
 VERSION = "1.0.0"
 
@@ -1020,7 +1020,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     p = lambda s="": print(s, file=out)
     p()
     tight = ink.red if free < 15 * 2 ** 30 else ink.green
-    p(f" {ink.bold('devspace')}  "
+    p(f" {ink.bold('andy')}  "
       f"{ink.dim(f'{human(total)} volume · {human(used)} used · ')}"
       f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
     p()
@@ -1061,9 +1061,9 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
               f"{shorten(n.label, namew).ljust(namew)}  {ink.dim(shorten(path, room))}")
 
     p()
-    p(f" {ink.dim('devspace -i')} to browse   "
-      f"{ink.dim('devspace --commands')} to print reclaim commands   "
-      f"{ink.dim('devspace --tree')} for everything")
+    p(f" {ink.dim('andy -i')} to browse   "
+      f"{ink.dim('andy --commands')} to print reclaim commands   "
+      f"{ink.dim('andy --tree')} for everything")
     p()
 
 
@@ -1093,7 +1093,7 @@ def print_commands(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
     """Emit the reclaim commands as a commented script. Never runs anything."""
     p = lambda s="": print(s, file=out)
     p("#!/bin/sh")
-    p("# Reclaim commands suggested by devspace. NOTHING here has been run.")
+    p("# Reclaim commands suggested by andy. NOTHING here has been run.")
     p("# Read every line before you run it; some are destructive by design.")
     p(f"# generated {time.strftime('%Y-%m-%d %H:%M')}  ·  {human(m.total)} mapped")
     seen: set[str] = set()
@@ -1148,9 +1148,9 @@ def to_json(m: Model) -> dict:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        prog="devspace",
+        prog="andy",
         description="Show where developer tooling hides your disk space. Read-only.",
-        epilog="devspace never deletes, moves or modifies anything.",
+        epilog="andy never deletes, moves or modifies anything.",
     )
     ap.add_argument("roots", nargs="*", metavar="DIR",
                     help="directories to scan for project artifacts "
@@ -1169,7 +1169,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                     help="skip the per-project artifact scan (much faster)")
     ap.add_argument("--fresh", action="store_true", help="ignore the cached sizes")
     ap.add_argument("--no-color", action="store_true", help="disable colour")
-    ap.add_argument("-V", "--version", action="version", version=f"devspace {VERSION}")
+    ap.add_argument("-V", "--version", action="version", version=f"andy {VERSION}")
     return ap.parse_args(argv)
 
 
@@ -1200,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tui:
         from_tty = sys.stdout.isatty() and sys.stdin.isatty()
         if not from_tty:
-            print("devspace: -i needs a terminal", file=sys.stderr)
+            print("andy: -i needs a terminal", file=sys.stderr)
             return 2
         scanner.start()
         run_tui(model, scanner)
@@ -1429,7 +1429,7 @@ class Tui:
         m = self.m
         total, used, free = m.disk
         pct = used / total if total else 0.0
-        self.put(0, 1, "devspace", curses.A_BOLD)
+        self.put(0, 1, "andy", curses.A_BOLD)
         if m.finished:
             right = f"{m.count} locations · {m.elapsed:.1f}s"
             attr = self.DIM
@@ -1601,7 +1601,7 @@ class Tui:
         x0 = (w - bw) // 2
         for i in range(bh):
             self.put(y0 + i, x0, " " * bw, curses.A_REVERSE)
-        self.put(y0 + 1, x0 + 2, "devspace — keys", curses.A_REVERSE | curses.A_BOLD)
+        self.put(y0 + 1, x0 + 2, "andy — keys", curses.A_REVERSE | curses.A_BOLD)
         for i, (left, right) in enumerate(lines[: bh - 4]):
             y = y0 + 3 + i
             if not right:
