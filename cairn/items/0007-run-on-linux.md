@@ -2,7 +2,7 @@
 id: 7
 title: Run on Linux
 type: feature
-status: blocked
+status: done
 milestone: v1.1
 assignee: Oddur Sigurdsson
 depends_on:
@@ -73,7 +73,7 @@ should not say Linux is supported. 0007 covers that.
 - [x] Docker's live breakdown counts toward the total on Linux, and the
       reasoning is written down where the `informational` flag is defined
 - [x] No Apple-specific wording appears in the UI on Linux
-- [ ] Test suite passes on Linux in CI
+- [x] Test suite passes on Linux in CI
 - [x] README no longer says "on macOS"
 
 ## 2026-09-20

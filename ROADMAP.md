@@ -4,14 +4,9 @@
 
 ## v1.1 — v1.1
 
-`#######···` 67% · 4 of 6 done · due 2026-11-15
+`##########` 100% · 6 of 6 done · due 2026-11-15
 
 Correctness, speed and reach.
-
-### blocked
-
-- [ ] `0007` Run on Linux <sup>feature · p2</sup>
-- [ ] `0008` CI on macOS and Linux <sup>chore · p1</sup>
 
 ### done
 
@@ -19,4 +14,6 @@ Correctness, speed and reach.
 - [x] `0004` A test suite, and a file that can be imported to run it <sup>chore · p0</sup>
 - [x] `0005` Measure in process with a parallel walker instead of du(1) <sup>feature · p1</sup>
 - [x] `0006` Widen the catalog: editors, Nix, Unity, Swift, Bazel, and more artifact kinds <sup>feature · p2</sup>
+- [x] `0007` Run on Linux <sup>feature · p2</sup>
+- [x] `0008` CI on macOS and Linux <sup>chore · p1</sup>
 

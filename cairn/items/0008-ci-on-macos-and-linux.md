@@ -2,10 +2,9 @@
 id: 8
 title: CI on macOS and Linux
 type: chore
-status: blocked
+status: done
 milestone: v1.1
 assignee: Oddur Sigurdsson
-claimed: 2026-09-20
 depends_on:
 - 4
 created: 2026-09-20
@@ -38,8 +37,8 @@ default ruff config would fight, and a coverage number is not the problem here.
 
 ## Acceptance criteria
 
-- [ ] Workflow runs on push and pull request
-- [ ] Both platforms, both Python versions, green
+- [x] Workflow runs on push and pull request
+- [x] Both platforms, both Python versions, green
 - [x] The 3.9 floor is actually verified rather than asserted in prose
 - [x] A badge in the README only once it has been green on main
 
@@ -57,3 +56,11 @@ An expression inside an f-string could not span lines until Python 3.12 (PEP 701
 Two smaller things the CI script caught while being written. The first run leaves andy's own cache under ~/.cache, and ~/.cache is a catalog entry, so a second run in the same HOME measures it and the two engines appear to disagree by exactly one 4096-byte block; each run now gets a fresh HOME. And the --commands check greps for any line that is not blank or a comment, which is the only mechanical way to assert the thing the README promises about it.
 
 No badge in the README. It has never been green on main, because it has never run.
+
+## 2026-09-20
+
+Green on GitHub, both triggers, run 35517574090 (push) and 35517575776 (pull_request): macos-latest and ubuntu-latest, Python 3.9 and 3.13, plus the clipboard job.
+
+The first run failed, which is the best thing it could have done. The Ubuntu runner has a docker daemon with images loaded, and on Linux andy counts what "docker system df" reports because there is no VM disk there to duplicate -- so a test that built its own temp tree and asserted the total was under 20M measured the runner instead and saw 1.89G. Correct behaviour, badly isolated test, and invisible on macOS where those rows are informational. Nothing but a Linux machine with a live daemon would have shown it; no container I ran had one.
+
+The clipboard job passed all four of its cases on the real runner: xclip under Xvfb, xsel with xclip hidden, wl-copy on headless sway, and clip() returning False with nothing installed.
