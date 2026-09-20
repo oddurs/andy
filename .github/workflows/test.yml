@@ -149,3 +149,126 @@ jobs:
           python tests/clipboard_check.py none
         env:
           PYTHONPATH: tests
+
+  # ubuntu-latest is one shape of Linux: glibc, a full Python, a UTF-8 locale
+  # and default XDG paths. Every bug in the v1.2 milestone was invisible there.
+  shapes:
+    name: ${{ matrix.shape }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shape: [musl, no-curses, c-locale, xdg-elsewhere, no-home]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        if: matrix.shape != 'musl'
+        with:
+          python-version: "3.13"
+
+      - name: build the tree to scan
+        shell: bash
+        run: |
+          mkdir -p /tmp/t/app/node_modules /tmp/t/svc/target
+          : > /tmp/t/app/package.json
+          : > /tmp/t/svc/Cargo.toml
+          dd if=/dev/zero of=/tmp/t/app/node_modules/b.bin bs=1M count=6 2>/dev/null
+          dd if=/dev/zero of=/tmp/t/svc/target/c.bin bs=1M count=4 2>/dev/null
+
+      # musl and busybox, not glibc and coreutils
+      - name: musl
+        if: matrix.shape == 'musl'
+        run: |
+          docker run --rm -v "$PWD":/w -v /tmp/t:/tmp/t -w /w alpine:latest sh -c '
+            set -e
+            apk add --no-cache python3 >/dev/null
+            export DOCKER_HOST=unix:///nonexistent
+            python3 -m unittest discover -s tests
+            HOME=$(mktemp -d) python3 andy --json --fresh /tmp/t > /tmp/a.json
+            HOME=$(mktemp -d) python3 andy --json --fresh --walk /tmp/t > /tmp/b.json
+            python3 -c "
+          import json
+          a = json.load(open(\"/tmp/a.json\"))[\"mapped_bytes\"]
+          b = json.load(open(\"/tmp/b.json\"))[\"mapped_bytes\"]
+          assert a == b, f\"busybox du said {a}, the walker said {b}\"
+          assert a >= 10 * 2**20, a
+          print(\"musl ok:\", a)
+          "'
+
+      # a Python built without ncurses: every mode but -i must still work
+      - name: no-curses
+        if: matrix.shape == 'no-curses'
+        shell: bash
+        run: |
+          export DOCKER_HOST=unix:///nonexistent HOME=$(mktemp -d)
+          sudo mv "$(python -c 'import _curses; print(_curses.__file__)')" /tmp/curses.hidden
+          python -c "import _curses" 2>/dev/null && { echo "still importable"; exit 1; }
+          python andy --json --fresh /tmp/t > /dev/null
+          python andy --tree --fresh /tmp/t > /dev/null
+          python andy --commands --fresh /tmp/t > /dev/null
+          python andy --fresh -n 3 /tmp/t > /dev/null
+          if python andy -i /tmp/t 2>/tmp/e.txt; then echo "-i should have failed"; exit 1; fi
+          grep -q curses /tmp/e.txt || { echo "no explanation given:"; cat /tmp/e.txt; exit 1; }
+          python -m unittest discover -s tests
+          echo "no-curses ok"        # nothing to restore; the job ends here
+
+      # PEP 538 coercion defeated: the drawing characters must not be fatal
+      - name: c-locale
+        if: matrix.shape == 'c-locale'
+        shell: bash
+        run: |
+          export DOCKER_HOST=unix:///nonexistent HOME=$(mktemp -d)
+          export PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 LC_ALL=C LANG=C
+          for mode in "-n 3" "--tree" "--commands" "--json"; do
+            python andy --fresh $mode /tmp/t > /tmp/out.txt 2>/tmp/err.txt || {
+              echo "failed: $mode"; tail -5 /tmp/err.txt; exit 1; }
+            python - <<'PY'
+          data = open("/tmp/out.txt", "rb").read()
+          bad = [b for b in data if b > 127]
+          assert not bad, f"non-ascii bytes in a C locale: {bad[:8]}"
+          PY
+          done
+          python -m unittest discover -s tests
+          echo "c-locale ok"
+
+      # XDG_* pointed somewhere else entirely
+      - name: xdg-elsewhere
+        if: matrix.shape == 'xdg-elsewhere'
+        shell: bash
+        run: |
+          export DOCKER_HOST=unix:///nonexistent HOME=$(mktemp -d)
+          export XDG_CACHE_HOME=/tmp/xdg/cache XDG_DATA_HOME=/tmp/xdg/data
+          export XDG_CONFIG_HOME=/tmp/xdg/config XDG_STATE_HOME=/tmp/xdg/state
+          # mise is in the portable half of the catalog, so this step means the
+          # same thing whichever platform it is run on
+          mkdir -p "$XDG_CACHE_HOME/go-build" "$XDG_DATA_HOME/mise"
+          dd if=/dev/zero of="$XDG_CACHE_HOME/go-build/x" bs=1M count=14 2>/dev/null
+          dd if=/dev/zero of="$XDG_DATA_HOME/mise/x" bs=1M count=12 2>/dev/null
+          python andy --json --fresh /tmp/t > /tmp/x.json
+          python - <<'PY'
+          import json
+          doc = json.load(open("/tmp/x.json"))
+          paths = []
+          def visit(n):
+              paths.append(n.get("path", ""))
+              for c in n.get("children", ()):
+                  visit(c)
+          for c in doc["categories"]:
+              visit(c)
+          assert any(p.startswith("/tmp/xdg/cache") for p in paths), "XDG_CACHE_HOME ignored"
+          assert any(p.startswith("/tmp/xdg/data") for p in paths), "XDG_DATA_HOME ignored"
+          assert not any("/.cache" in p for p in paths), "looked in ~/.cache anyway"
+          print("xdg ok")
+          PY
+
+      # a HOME that was never created, as containers and systemd units hand over
+      - name: no-home
+        if: matrix.shape == 'no-home'
+        shell: bash
+        run: |
+          export DOCKER_HOST=unix:///nonexistent HOME=/tmp/never-created-at-all
+          python andy --json --fresh /tmp/t > /dev/null
+          python andy --fresh -n 3 /tmp/t > /dev/null
+          echo "no-home ok"

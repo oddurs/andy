@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from andymod import andy
 
@@ -147,7 +148,7 @@ class Labels(Tree):
 
     def test_a_long_path_is_elided_in_the_middle(self):
         label = andy.project_label("/r/a/b/c/d/e/node_modules", ["/r"])
-        self.assertIn("…", label)
+        self.assertIn(andy.ELLIPSIS, label)
         self.assertTrue(label.startswith("a/b"))
         self.assertTrue(label.endswith("node_modules"))
 
@@ -171,7 +172,8 @@ class Labels(Tree):
         with open(os.path.join(d, "device.plist"), "wb") as fh:
             plistlib.dump({"name": "iPhone 17",
                            "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-26-0"}, fh)
-        self.assertEqual(andy.name_for(d, "simulator"), "iPhone 17 · iOS 26 0")
+        self.assertEqual(andy.name_for(d, "simulator"),
+                         f"iPhone 17 {andy.DOT} iOS 26 0")
 
 
 class Parsing(unittest.TestCase):
@@ -214,6 +216,21 @@ class Catalog(unittest.TestCase):
         self.assertEqual(len(paths), len(set(paths)),
                          sorted(p for p in paths if paths.count(p) > 1))
 
+    def test_expand_globs_are_expanded(self):
+        """cairn 0016. glob.glob does not expand `~`, so 20 of the 21 specs
+        using `expand` matched nothing and itemisation never once ran."""
+        for spec in andy.CATALOG:
+            if spec.expand:
+                self.assertFalse(spec.expand.startswith("~"),
+                                 f"{spec.label}: {spec.expand} will match nothing")
+                self.assertTrue(spec.expand.startswith("/"), spec.label)
+
+    def test_an_expand_glob_sits_under_its_own_path(self):
+        for spec in andy.CATALOG:
+            if spec.expand:
+                self.assertTrue(spec.expand.startswith(spec.path + os.sep),
+                                f"{spec.label}: {spec.expand} is not under {spec.path}")
+
     def test_paths_are_absolute(self):
         for spec in andy.CATALOG:
             self.assertTrue(spec.path.startswith("/"), f"{spec.label}: {spec.path}")
@@ -240,6 +257,25 @@ class Catalog(unittest.TestCase):
         for kind in kinds:
             safety = andy.ARTIFACT_SAFETY.get(kind, andy.REBUILD)
             self.assertIn(safety, (andy.SAFE, andy.REBUILD, andy.REVIEW), kind)
+
+    def test_itemising_actually_produces_children(self):
+        """The end of 0016: build a tree the glob matches and watch it split."""
+        root = os.path.realpath(tempfile.mkdtemp(prefix="andy-expand-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name in ("stable", "nightly", "1.88"):
+            os.makedirs(os.path.join(root, name))
+        spec = andy.S(andy.TOOLCHAINS, "toolchains", root, "note",
+                      expand=os.path.join(root, "*"))
+        model = andy.Model()
+        scanner = andy.Scanner(model, [], include_projects=False, use_cache=False)
+        with mock.patch.object(andy, "CATALOG", [spec]):
+            tasks = scanner._build_catalog({})
+        labels = {n.label for n in tasks}
+        self.assertEqual(labels, {"toolchains", "stable", "nightly", "1.88"})
+        parent = next(n for n in tasks if n.label == "toolchains")
+        self.assertEqual(len(parent.children), 3)
+        self.assertTrue(all(c.detail for c in parent.children),
+                        "a breakdown was not marked as one")
 
     def test_pruned_names_are_names_we_classify(self):
         known = set(andy.ARTIFACTS_STRICT) | set(andy.ARTIFACTS_AMBIGUOUS)

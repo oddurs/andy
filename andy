@@ -13,7 +13,6 @@ running it is your call.
 from __future__ import annotations
 
 import argparse
-import curses
 import glob
 import json
 import os
@@ -29,9 +28,64 @@ from collections import deque
 from dataclasses import dataclass, field
 
 HOME = os.path.expanduser("~")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "andy")
+
+
+def xdg(var: str, default: str) -> str:
+    """An XDG base directory, or its default under HOME.
+
+    The spec says a relative value is invalid and must be ignored, which also
+    catches the empty string a shell leaves behind when a variable is set but
+    unset. andy honours these on macOS too: a tool that reads XDG_CACHE_HOME on
+    Linux reads it on a Mac as well, and andy should look where the tool put
+    things rather than where the platform suggests.
+    """
+    value = os.environ.get(var, "")
+    return value.rstrip(os.sep) if value.startswith(os.sep) else os.path.join(HOME, default)
+
+
+XDG_CACHE = xdg("XDG_CACHE_HOME", ".cache")
+XDG_CONFIG = xdg("XDG_CONFIG_HOME", ".config")
+XDG_DATA = xdg("XDG_DATA_HOME", os.path.join(".local", "share"))
+XDG_STATE = xdg("XDG_STATE_HOME", os.path.join(".local", "state"))
+
+# Longest first, so ~/.local/share wins over ~/.local.
+XDG_PREFIXES = tuple(sorted(
+    ((os.path.join(HOME, ".cache"), XDG_CACHE),
+     (os.path.join(HOME, ".config"), XDG_CONFIG),
+     (os.path.join(HOME, ".local", "share"), XDG_DATA),
+     (os.path.join(HOME, ".local", "state"), XDG_STATE)),
+    key=lambda pair: -len(pair[0])))
+
+
+def xdg_path(path: str) -> str:
+    """Rewrite a catalog path onto wherever XDG actually points.
+
+    The catalog is written with ~/.cache/... literals because that is what the
+    entries are called and what a reader recognises. This is the one place the
+    variables are applied, so the catalog stays readable and the lookup stays
+    correct.
+    """
+    for default, actual in XDG_PREFIXES:
+        if default == actual:
+            continue
+        if path == default:
+            return actual
+        if path.startswith(default + os.sep):
+            return actual + path[len(default):]
+    return path
+
+
+CACHE_DIR = os.path.join(XDG_CACHE, "andy")
 CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+
+# Only -i needs curses, and a Python built without ncurses is ordinary on the
+# minimal machines where somebody wants `andy --json` from a script. Importing
+# it eagerly made every mode depend on a terminal library none of them use.
+try:
+    import curses
+except ImportError:                                     # pragma: no cover
+    curses = None                                       # type: ignore[assignment]
 
 MACOS = sys.platform == "darwin"
 PLATFORM = "darwin" if MACOS else "linux"
@@ -40,6 +94,54 @@ FILE_MANAGER = "Finder" if MACOS else "your file manager"
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
+def encodable(text: str, stream) -> bool:
+    """Whether this stream can actually put `text` on the screen."""
+    encoding = getattr(stream, "encoding", None) or "ascii"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+# Python normally coerces a C locale to C.UTF-8 (PEP 538) and andy's drawing
+# characters survive. With that coercion off -- PYTHONCOERCECLOCALE=0, which
+# some containers set -- or in a genuinely 8-bit locale, encoding them raises
+# and the report dies on its first line. So the glyphs are chosen from what the
+# stream can carry, and there is an ASCII set for when it can carry nothing.
+UNICODE = encodable("\u2588\u258f\u00b7\u2500\u2026\u2265\u25b8\u25be\u280b", sys.stdout)
+
+if UNICODE:
+    FULL_CELL = "\u2588"
+    PARTIAL_CELLS = "\u258f\u258e\u258d\u258c\u258b\u258a\u2589"
+    DOT, RULE, ELLIPSIS, ATLEAST = "\u00b7", "\u2500", "\u2026", "\u2265"
+    CLOSED, OPENED, SCROLLBAR = "\u25b8", "\u25be", "\u258c"
+    ENTER = "\u21b5"
+    DASH = "\u2014"
+    CRUMB = "\u203a"
+    UP, DOWN, LEFT, RIGHT = "\u2191", "\u2193", "\u2190", "\u2192"
+    SPINNER = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+else:
+    FULL_CELL = "#"
+    PARTIAL_CELLS = " " * 7          # ASCII has no eighth-cells to draw with
+    DOT, RULE, ELLIPSIS, ATLEAST = "*", "-", "...", ">="
+    CLOSED, OPENED, SCROLLBAR = ">", "v", "|"
+    ENTER = "enter"
+    DASH = "--"
+    CRUMB = ">"
+    UP, DOWN, LEFT, RIGHT = "up", "down", "left", "right"
+    SPINNER = "|/-\\"
+
+# stdout may still meet something neither branch anticipated -- an 8-bit
+# encoding that carries some of this and not the rest. Replacing is ugly and
+# never fatal, which is the right trade for a read-only report.
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:                                       # pragma: no cover
+    pass
+
 
 def human(n: int, pad: bool = False) -> str:
     """Bytes as a short human string: 4.7G, 812M, 3.1K."""
@@ -68,7 +170,9 @@ def clip_end(text: str, width: int) -> str:
         return ""
     if len(text) <= width:
         return text
-    return text[:width - 1] + "…" if width > 1 else text[:1]
+    if width <= len(ELLIPSIS):
+        return text[:width]
+    return text[:width - len(ELLIPSIS)] + ELLIPSIS
 
 
 def shorten(text: str, width: int) -> str:
@@ -77,14 +181,11 @@ def shorten(text: str, width: int) -> str:
         return ""
     if len(text) <= width:
         return text
-    if width <= 3:
+    keep = width - len(ELLIPSIS)
+    if keep <= 1:
         return text[:width]
-    keep = width - 1
     head = keep // 3
-    return text[:head] + "…" + text[len(text) - (keep - head):]
-
-
-BLOCKS = " ▏▎▍▌▋▊▉█"
+    return text[:head] + ELLIPSIS + text[len(text) - (keep - head):]
 
 
 def bar(fraction: float, width: int) -> str:
@@ -95,9 +196,9 @@ def bar(fraction: float, width: int) -> str:
     eighths = int(round(fraction * width * 8))
     full, rem = divmod(eighths, 8)
     full = min(full, width)
-    out = "█" * full
+    out = FULL_CELL * full
     if rem and full < width:
-        out += BLOCKS[rem]
+        out += PARTIAL_CELLS[rem - 1]
     return out.ljust(width)
 
 
@@ -125,6 +226,23 @@ def clip(text: str) -> bool:
 
 def usable_dir(path: str) -> bool:
     return os.path.isdir(path) and not os.path.islink(path)
+
+
+def disk_usage(path: str = HOME) -> tuple[int, int, int]:
+    """Volume totals for `path`, falling back when it cannot be read.
+
+    HOME is not guaranteed to exist. A container running as a uid with no passwd
+    entry, a systemd unit with HOME unset, `su` without `-` -- all of them hand a
+    program a home that was never created, and dying on the first statvfs is a
+    poor way to report it. Which volume the header describes is a detail; the
+    scan is the point."""
+    for candidate in (path, os.getcwd(), os.sep):
+        try:
+            total, used, free = shutil.disk_usage(candidate)
+            return total, used, free
+        except OSError:
+            continue
+    return 0, 0, 0
 
 
 # --------------------------------------------------------------------------- #
@@ -487,7 +605,9 @@ class Spec:
 
 def S(cat, label, path, note="", cmd="", safety=SAFE, expand=None, namer=None,
       only=None) -> Spec:
-    path = os.path.expanduser(path)
+    path = xdg_path(os.path.expanduser(path))
+    if expand:
+        expand = xdg_path(os.path.expanduser(expand))
     if only is None and "/Library/" in path:
         # Anything under ~/Library or /Library is Apple's layout. usable_dir
         # would filter these out on Linux anyway; tagging them means `--json`
@@ -781,6 +901,10 @@ CATALOG: list[Spec] = [
       "Provider binaries, ~100MB each.", "rm -rf ~/.terraform.d/plugin-cache", REBUILD),
     S(BUILD, "Vercel CLI cache", "~/Library/Caches/com.vercel.cli", "Build and deploy cache.",
       "rm -rf ~/Library/Caches/com.vercel.cli"),
+    S(APPS, "andy's own cache", CACHE_DIR,
+      "andy's cached scan results, so the next run starts from the last one. "
+      "Deleting it costs you one cold scan and nothing else.",
+      "rm -rf " + tilde(CACHE_DIR)),
     S(BUILD, "other in ~/.cache", "~/.cache",
       "Everything in ~/.cache that is not itemised elsewhere here.", "", REVIEW),
 
@@ -970,6 +1094,66 @@ LINUX_CATALOG: list[Spec] = [
       only="linux"),
     S(APPS, "Trash", "~/.local/share/Trash",
       "Deleted files still occupying the disk.", "", REVIEW, only="linux"),
+
+    # ---- things with no macOS counterpart at all
+    S(CONTAINERS, "Podman (system)", "/var/lib/containers",
+      "Rootful podman image and container storage. Needs root to read, so the "
+      "figure may be short.", "sudo podman system reset", REBUILD, only="linux"),
+    S(TOOLCHAINS, "Flatpak (system)", "/var/lib/flatpak",
+      "System-wide Flatpak runtimes and applications, usually the larger half.",
+      "flatpak uninstall --unused", REVIEW, only="linux"),
+    S(TOOLCHAINS, "snap revisions", "/var/lib/snapd/snaps",
+      "Every snap revision kept for rollback, at several per package.",
+      "sudo snap set system refresh.retain=2", REVIEW, only="linux"),
+    S(TOOLCHAINS, "Linuxbrew", "/home/linuxbrew/.linuxbrew",
+      "A Homebrew installation and everything it has built.", "", REVIEW,
+      only="linux"),
+    S(PACKAGES, "apt archives", "/var/cache/apt/archives",
+      "Downloaded .deb files kept after installing. Re-downloadable.",
+      "sudo apt-get clean", REBUILD, only="linux"),
+    S(PACKAGES, "pacman packages", "/var/cache/pacman/pkg",
+      "Every package version pacman has downloaded. Routinely tens of gigabytes.",
+      "sudo paccache -rk1", REVIEW, only="linux"),
+    S(PACKAGES, "dnf cache", "/var/cache/dnf",
+      "Downloaded rpms and repository metadata.", "sudo dnf clean all",
+      REBUILD, only="linux"),
+    S(PACKAGES, "zypper cache", "/var/cache/zypp",
+      "Downloaded rpms and repository metadata.", "sudo zypper clean --all",
+      REBUILD, only="linux"),
+    S(PACKAGES, "yay build cache", "~/.cache/yay",
+      "AUR sources and the packages built from them.", "yay -Sc", REBUILD,
+      only="linux"),
+    S(PACKAGES, "paru build cache", "~/.cache/paru",
+      "AUR sources and the packages built from them.", "paru -Sc", REBUILD,
+      only="linux"),
+    S(PACKAGES, "Homebrew downloads", "~/.cache/Homebrew",
+      "Bottles and source tarballs Linuxbrew has downloaded.",
+      "brew cleanup --prune=all", only="linux"),
+    S(APPS, "Neovim data", "~/.local/share/nvim",
+      "Plugins, parsers and language servers nvim has installed.", "", REVIEW,
+      only="linux"),
+    S(APPS, "Neovim state", "~/.local/state/nvim",
+      "Shada, swap, undo history and logs.", "", REVIEW, only="linux"),
+    S(APPS, "Neovim cache", "~/.cache/nvim", "Compiled Lua and plugin caches.",
+      "rm -rf ~/.cache/nvim", only="linux"),
+    S(APPS, "Vim plugins", "~/.vim/plugged",
+      "Plugins installed by vim-plug.", "", REVIEW, only="linux"),
+
+    # ---- portable, but only ever written down for macOS
+    S(BUILD, "ccache (classic)", "~/.ccache",
+      "Where ccache puts things unless CCACHE_DIR says otherwise.", "ccache -C"),
+    S(BUILD, "golangci-lint cache", "~/.cache/golangci-lint",
+      "Analysis results cached between lint runs.",
+      "golangci-lint cache clean"),
+    S(BUILD, "staticcheck cache", "~/.cache/staticcheck",
+      "Analysis results cached between runs.", "rm -rf ~/.cache/staticcheck"),
+    S(PACKAGES, "virtualenv app data", "~/.local/share/virtualenv",
+      "Wheels and seed packages virtualenv reuses when making environments.",
+      "virtualenv --reset-app-data", REBUILD),
+    S(PACKAGES, "PDM cache", "~/.cache/pdm",
+      "Wheels and package metadata cached by PDM.", "pdm cache clear"),
+    S(PACKAGES, "Hatch data", "~/.local/share/hatch",
+      "Hatch environments, one per project.", "hatch env prune", REBUILD),
 ]
 
 CATALOG = [s for s in CATALOG + LINUX_CATALOG if s.only in (None, PLATFORM)]
@@ -1187,7 +1371,7 @@ def docker_breakdown() -> list[tuple[str, int, str, str, str]]:
         if active not in ("", "0", 0):
             note += f", {active} in use"
         if recl:
-            note += f" · {recl} reclaimable"
+            note += f" {DOT} {recl} reclaimable"
         rows.append((label, size, cmd, safety, note))
     return rows
 
@@ -1229,6 +1413,7 @@ class Node:
     informational: bool = False     # a view onto bytes counted elsewhere
     blocked: bool = False           # the walk did not finish in the time it had
     partial: bool = False           # `measured` is a floor, not the whole figure
+    detail: bool = False            # a breakdown of its parent, not a location
     depth: int = 0
 
     @property
@@ -1251,7 +1436,7 @@ class Model:
         self.started = time.time()
         self.elapsed = 0.0
         self.roots: list[str] = []
-        self.disk = shutil.disk_usage(HOME)
+        self.disk = disk_usage()
         self.generation = 0          # bumps whenever the tree changes shape
 
     # -- tree maintenance ---------------------------------------------------- #
@@ -1279,7 +1464,11 @@ class Model:
             """Sets node.size for display; returns what it adds to its parent."""
             contributions = [roll(c) for c in node.children]
             if node.measured is not None:
-                node.size = max(0, node.measured - node.inner)
+                # `inner` took the itemised children out of this measurement so
+                # nothing is counted twice; the children put themselves back.
+                # Without the second half a location whose children itemise all
+                # of it contributes nothing, and its category loses the lot.
+                node.size = max(0, node.measured - node.inner) + sum(contributions)
             elif node.informational:
                 node.size = sum(c.size for c in node.children)
             else:
@@ -1294,8 +1483,17 @@ class Model:
             roll(cat)
         self.categories.sort(key=lambda c: (-c.size, c.label))
         self.total = sum(c.size for c in self.categories)
-        self.count = sum(1 for n in self.walk()
-                         if n.measured is not None and n.size > 0 and not n.informational)
+        self.count = sum(1 for n in self.walk() if self.is_location(n))
+
+    @staticmethod
+    def is_location(node: Node) -> bool:
+        """A place on disk andy is reporting, rather than a breakdown of one.
+
+        The individual rustup toolchains under `rustup toolchains` are the same
+        bytes said twice; they belong in the tree, not in a count of locations
+        or a list of the largest things found."""
+        return (node.measured is not None and node.size > 0
+                and not node.informational and not node.detail)
 
     def walk(self, nodes: list[Node] | None = None):
         for n in (self.categories if nodes is None else nodes):
@@ -1407,7 +1605,7 @@ class Scanner:
             with m.lock:
                 parent = m.category(CONTAINERS)
                 live = Node(
-                    label="docker · live breakdown" if duplicate else "docker",
+                    label=f"docker {DOT} live breakdown" if duplicate else "docker",
                     note=("What the running daemon holds. These bytes sit inside the "
                           "VM disk above, so they are not added to the total."
                           if duplicate else
@@ -1481,7 +1679,7 @@ class Scanner:
                             label=name_for(child_path, spec.namer),
                             path=os.path.normpath(child_path),
                             note=spec.note, cmd=spec.cmd, safety=spec.safety,
-                            kind=spec.cat,
+                            kind=spec.cat, detail=True,
                         )
                         if child.path in cached_sizes:
                             child.measured = cached_sizes[child.path]
@@ -1623,7 +1821,7 @@ def name_for(path: str, namer: str | None) -> str:
                 d = plistlib.load(fh)
             name = d.get("name") or base
             runtime = (d.get("runtime") or "").split(".")[-1].replace("-", " ")
-            return f"{name} · {runtime}".strip(" ·")
+            return f"{name} {DOT} {runtime}".strip(" " + DOT)
         except Exception:
             return base
     return base
@@ -1639,7 +1837,7 @@ def project_label(path: str, roots: list[str]) -> str:
         rel = tilde(path)
     parts = rel.split(os.sep)
     if len(parts) > 4:
-        parts = parts[:2] + ["…"] + parts[-2:]
+        parts = parts[:2] + [ELLIPSIS] + parts[-2:]
     return os.sep.join(parts)
 
 
@@ -1693,7 +1891,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     p()
     tight = ink.red if free < 15 * 2 ** 30 else ink.green
     p(f" {ink.bold('andy')}  "
-      f"{ink.dim(f'{human(total)} volume · {human(used)} used · ')}"
+      f"{ink.dim(f'{human(total)} volume {DOT} {human(used)} used {DOT} ')}"
       f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
     p()
 
@@ -1707,20 +1905,16 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     for c in m.categories:
         if c.size <= 0:
             continue
-        leaves = sum(1 for n in m.walk([c])
-                     if n.measured is not None and n.size > 0 and not n.informational)
+        leaves = sum(1 for n in m.walk([c]) if m.is_location(n))
         p(f"  {c.label.ljust(labelw)}{ink.magnitude(c.size, human(c.size, pad=True))}  "
           f"{ink.accent(bar(c.size / biggest, barw))} {ink.dim(str(leaves))}")
-    p(f"  {'':{labelw}}{ink.dim('─────')}")
+    p(f"  {'':{labelw}}{ink.dim(RULE * 5)}")
     share = f"{m.total / used * 100:.0f}% of used space" if used else ""
     p(f"  {ink.bold('total'.ljust(labelw))}{ink.bold(human(m.total, pad=True))}  {ink.dim(share)}")
 
     if top:
-        items = sorted(
-            (n for n in m.walk()
-             if n.measured is not None and n.size > 0 and not n.informational),
-            key=lambda n: -n.size,
-        )[:top]
+        items = sorted((n for n in m.walk() if m.is_location(n)),
+                       key=lambda n: -n.size)[:top]
         p()
         p(f" {ink.head('largest items')}")
         p()
@@ -1744,7 +1938,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
                 known = f" (last scan: {human(n.size)})"
             else:
                 known = " (nothing counted)"
-            p(f"   {ink.dim('·')} {n.label}{ink.dim(known)}")
+            p(f"   {ink.dim(DOT)} {n.label}{ink.dim(known)}")
         # Built outside the f-string: an expression may not span lines inside one
         # until Python 3.12, and andy supports 3.9.
         why = ("these are floors, not totals. A running container VM or a network "
@@ -1771,7 +1965,7 @@ def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
         def emit(node: Node, depth: int) -> None:
             for child in node.children:
                 if child.size < min_bytes and not child.informational:
-                    continue
+                    continue        # too small to show, and so is everything in it
                 pad = "  " + "  " * depth
                 label = shorten(child.label, max(20, w - len(pad) - 30))
                 p(f"{pad}{ink.magnitude(child.size, human(child.size, pad=True))}  {label}")
@@ -1787,7 +1981,7 @@ def print_commands(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
     p("#!/bin/sh")
     p("# Reclaim commands suggested by andy. NOTHING here has been run.")
     p("# Read every line before you run it; some are destructive by design.")
-    p(f"# generated {time.strftime('%Y-%m-%d %H:%M')}  ·  {human(m.total)} mapped")
+    p(f"# generated {time.strftime('%Y-%m-%d %H:%M')}  {DOT}  {human(m.total)} mapped")
     seen: set[str] = set()
     for c in m.categories:
         rows = []
@@ -1811,6 +2005,8 @@ def to_json(m: Model) -> dict:
         d = {"label": n.label, "bytes": n.size}
         if n.informational:
             d["informational"] = True
+        if n.detail:
+            d["detail"] = True
         if n.blocked:
             # `bytes` is a floor rather than a total: the walk did not finish
             d["complete"] = False
@@ -1904,6 +2100,10 @@ def main(argv: list[str] | None = None) -> int:
                       use_walker=args.use_walker)
 
     if args.tui:
+        if curses is None:
+            print("andy: -i needs curses, and this Python was built without it. "
+                  "Every other mode works.", file=sys.stderr)
+            return 2
         from_tty = sys.stdout.isatty() and sys.stdin.isatty()
         if not from_tty:
             print("andy: -i needs a terminal", file=sys.stderr)
@@ -1917,13 +2117,12 @@ def main(argv: list[str] | None = None) -> int:
     quiet = args.json or args.commands
 
     scanner.start()
-    spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     i = 0
     while not model.finished:
         if not quiet and sys.stderr.isatty():
             with model.lock:
                 done, pend, phase = model.done, model.pending, model.phase
-            print(f"\r\033[2K {ink.accent(spin[i % len(spin)])} {phase} "
+            print(f"\r\033[2K {ink.accent(SPINNER[i % len(SPINNER)])} {phase} "
                   f"{ink.dim(f'{done}/{pend}')}", end="", file=sys.stderr, flush=True)
         i += 1
         time.sleep(0.08)
@@ -1948,8 +2147,6 @@ def main(argv: list[str] | None = None) -> int:
 # --------------------------------------------------------------------------- #
 # interactive browser
 # --------------------------------------------------------------------------- #
-
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 # A sequential ramp of xterm-256 greys, darkest first, each paired with the label
 # colour that gives it the better contrast (worst case 4.54:1, so every label
@@ -2052,14 +2249,14 @@ def map_cells(nodes: list[Node], x0: int, y0: int, width: int, height: int):
 
 HELP = [
     ("moving", [
-        ("j / ↓", "down"),
-        ("k / ↑", "up"),
+        (f"j / {DOWN}", "down"),
+        (f"k / {UP}", "up"),
         ("ctrl-d / ctrl-u", "half a page"),
         ("g / G", "first / last"),
     ]),
     ("opening", [
-        ("↵  space  tab", "expand or collapse"),
-        ("→ / ←", "expand / collapse"),
+        (f"{ENTER}  space  tab", "expand or collapse"),
+        (f"{RIGHT} / {LEFT}", "expand / collapse"),
         ("e / E", "expand / collapse all"),
     ]),
     ("finding", [
@@ -2078,12 +2275,12 @@ HELP = [
     ]),
     ("the area map", [
         ("m", "sizes as areas, or back"),
-        ("↵", "open the highlighted one"),
-        ("←  backspace", "up a level"),
+        (ENTER, "open the highlighted one"),
+        (f"{LEFT}  backspace", "up a level"),
     ]),
     ("the mouse", [
         ("click", "select a row or cell"),
-        ("click ▸", "open or close a branch"),
+        (f"click {CLOSED}", "open or close a branch"),
         ("double click", f"open, or reveal in {FILE_MANAGER}"),
         ("right click", "copy the command"),
         ("wheel", "scroll the list"),
@@ -2096,9 +2293,9 @@ BLOCKED_HINT = ("the walk ran out of time here; a running container VM or a "
                 "network mount blocks on I/O for minutes at a stretch.")
 
 SAFETY_TEXT = {
-    SAFE: "safe — regenerates itself",
-    REBUILD: "rebuild — fine to remove, costs you a rebuild",
-    REVIEW: "review — may hold something you want",
+    SAFE: f"safe {DASH} regenerates itself",
+    REBUILD: f"rebuild {DASH} fine to remove, costs you a rebuild",
+    REVIEW: f"review {DASH} may hold something you want",
 }
 
 
@@ -2133,14 +2330,18 @@ class Tui:
 
     # -- curses plumbing ----------------------------------------------------- #
 
-    # ncurses built with mouse version 1 has no BUTTON5, and misreports a
-    # wheel-down as a position report. It only ever enables xterm mode 1000,
-    # which never sends motion, so that bit is unambiguous here.
-    WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", curses.REPORT_MOUSE_POSITION)
-    CLICK = (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)
-    RIGHT_CLICK = (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED)
-
     def setup(self) -> None:
+        # These were class attributes once, which meant the class body touched
+        # curses at import time and andy needed a terminal library to print
+        # JSON. They are resolved here instead, inside curses.wrapper.
+        #
+        # ncurses built with mouse version 1 has no BUTTON5, and misreports a
+        # wheel-down as a position report. It only ever enables xterm mode 1000,
+        # which never sends motion, so that bit is unambiguous here.
+        self.WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED",
+                                  curses.REPORT_MOUSE_POSITION)
+        self.CLICK = curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED
+        self.RIGHT_CLICK = curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED
         curses.curs_set(0)
         self.s.nodelay(True)
         self.s.keypad(True)
@@ -2207,7 +2408,7 @@ class Tui:
         """Six columns: the size, with a leading sign when it is only a floor."""
         if node.blocked and node.measured is None:
             return "     ?"
-        return ("≥" if node.partial else " ") + human(node.size, pad=True)
+        return (ATLEAST if node.partial else " ") + human(node.size, pad=True)
 
     def note(self, text: str, seconds: float = 2.0) -> None:
         self.message = text
@@ -2304,18 +2505,18 @@ class Tui:
         self.put(0, 0, " " * (w - 1))
         self.put(0, 1, "andy", curses.A_BOLD)
         if m.finished:
-            right = f"{m.count} locations · {m.elapsed:.1f}s"
+            right = f"{m.count} locations {DOT} {m.elapsed:.1f}s"
             attr = self.DIM
         else:
             right = (f"{SPINNER[self.tick % len(SPINNER)]} {m.phase} "
                      f"{m.done}/{max(m.pending, 1)}")
             attr = self.ACCENT
         self.put(0, max(11, w - len(right) - 2), right, attr)
-        self.put(1, 1, "─" * max(0, w - 2), self.DIM)
+        self.put(1, 1, RULE * max(0, w - 2), self.DIM)
 
         low = free < 15 * 2 ** 30
         self.put(2, 1, "volume", self.DIM)
-        lead = f"{human(total)} · {human(used)} used · "
+        lead = f"{human(total)} {DOT} {human(used)} used {DOT} "
         free_text = f"{human(free)} free"
         self.put(2, 9, lead)
         x = 9 + len(lead)
@@ -2335,13 +2536,13 @@ class Tui:
         self.put(3, 9, human(m.total), curses.A_BOLD | self.magnitude(m.total))
         self.put(3, 9 + len(human(m.total)) + 2, share, self.DIM)
         if self.filter:
-            tag = f"filter: {self.filter}" + ("█" if self.typing else "")
+            tag = f"filter: {self.filter}" + (FULL_CELL if self.typing else "")
             self.put(3, max(40, w - len(tag) - 2), tag, self.ACCENT)
-        self.put(4, 1, "─" * max(0, w - 2), self.DIM)
+        self.put(4, 1, RULE * max(0, w - 2), self.DIM)
 
     def draw_body(self, y0: int, body: int, w: int) -> None:
         if not self.rows:
-            self.put(y0 + 1, 3, "no matches" if self.filter else "scanning…", self.DIM)
+            self.put(y0 + 1, 3, "no matches" if self.filter else "scanning" + ELLIPSIS, self.DIM)
             return
         if self.cursor < self.top:
             self.top = self.cursor
@@ -2366,7 +2567,7 @@ class Tui:
             selected = idx == self.cursor
             indent = "  " * depth
             if node.children:
-                glyph = "▾ " if (node.expanded or self.filter) else "▸ "
+                glyph = (OPENED if (node.expanded or self.filter) else CLOSED) + " "
             else:
                 glyph = "  "
             label = node.label if depth else node.label.upper()
@@ -2405,9 +2606,9 @@ class Tui:
     def draw_map(self, y0: int, body: int, w: int) -> None:
         level = self.map_level()
         self.put(y0, 0, " " * (w - 1))
-        trail = " › ".join(n.label for n in self.map_stack) or "all categories"
+        trail = f" {CRUMB} ".join(n.label for n in self.map_stack) or "all categories"
         total = sum(n.size for n in level if not n.informational)
-        head = f"{trail}" + ("   ← back" if self.map_stack else "")
+        head = f"{trail}" + (f"   {LEFT} back" if self.map_stack else "")
         self.put(y0, 1, shorten(head, w - 16), curses.A_BOLD)
         shown = len([n for n in level if n.size > 0 and not n.informational])
         right = f"{human(total)} in {shown}"
@@ -2424,10 +2625,10 @@ class Tui:
         self.map_cells, skipped = map_cells(level, 1, y0 + 2, w - 2, area_h)
         if skipped:
             small = sum(n.size for n in skipped)
-            tag = f"+{len(skipped)} too small to draw · {human(small)}"
+            tag = f"+{len(skipped)} too small to draw {DOT} {human(small)}"
             self.put(y0 + 1, 1, tag, self.DIM)
         if not self.map_cells:
-            self.put(y0 + 2, 1, "nothing measured yet…", self.DIM)
+            self.put(y0 + 2, 1, "nothing measured yet" + ELLIPSIS, self.DIM)
             return
         self.map_sel = max(0, min(self.map_sel, len(self.map_cells) - 1))
 
@@ -2461,7 +2662,7 @@ class Tui:
         for i in range(body):
             self.zone(y0 + i, 0, 0, "scroll", i)
             if top <= i < top + height:
-                self.put(y0 + i, 0, "▌", self.ACCENT)
+                self.put(y0 + i, 0, SCROLLBAR, self.ACCENT)
 
     def parent_of(self, target: Node) -> Node | None:
         stack = list(self.m.categories)
@@ -2474,7 +2675,7 @@ class Tui:
         return None
 
     def draw_detail(self, y0: int, height: int, w: int) -> None:
-        self.put(y0, 1, "─" * max(0, w - 2), self.DIM)
+        self.put(y0, 1, RULE * max(0, w - 2), self.DIM)
         node = self.focus()
         if node is None:
             return
@@ -2487,9 +2688,8 @@ class Tui:
             self.zone(y0 + 2, 1, w - 2, "copypath")
         elif node.children:
             biggest = max(node.children, key=lambda c: c.size)
-            leaves = sum(1 for n in self.m.walk([node])
-                         if n.measured is not None and not n.informational)
-            summary = (f"{leaves} location{'s' if leaves != 1 else ''} · "
+            leaves = sum(1 for n in self.m.walk([node]) if self.m.is_location(n))
+            summary = (f"{leaves} location{'s' if leaves != 1 else ''} {DOT} "
                        f"largest is {biggest.label} at {human(biggest.size)}")
             self.put(y0 + 2, 1, shorten(summary, w - 3), self.DIM)
 
@@ -2501,7 +2701,7 @@ class Tui:
                 extra = " Showing the previous scan's figure."
             else:
                 extra = " Nothing was counted."
-            note = "incomplete — " + BLOCKED_HINT + extra
+            note = f"incomplete {DASH} " + BLOCKED_HINT + extra
         if note:
             self.put(y0 + 3, 1, shorten(note, w - 3),
                      self.RED if node.blocked else 0)
@@ -2511,7 +2711,7 @@ class Tui:
             self.zone(y0 + 4, 1, w - 2, "copycmd")
         elif node.path:
             self.put(y0 + 4, 1, "reclaim", self.DIM)
-            self.put(y0 + 4, 9, "no single command — inspect it first", self.DIM)
+            self.put(y0 + 4, 9, f"no single command {DASH} inspect it first", self.DIM)
 
         if height >= 6:
             # a grouping row is not a thing you can delete, so it gets no rating
@@ -2524,7 +2724,7 @@ class Tui:
                 self.put(y0 + 5, 1, "counted", self.DIM)
                 self.put(y0 + 5, 9, "inside the entry above, not added to the total",
                          self.DIM)
-            hint = "c copy command · y copy path"
+            hint = f"c copy command {DOT} y copy path"
             if w > 78:
                 self.put(y0 + 5, w - len(hint) - 2, hint, self.DIM)
 
@@ -2534,17 +2734,17 @@ class Tui:
             self.put(y, 1, self.message, self.ACCENT | curses.A_BOLD)
             return
         if self.typing:
-            self.put(y, 1, f"/{self.filter}█   "
-                           f"↵ keep · esc clear", self.ACCENT)
+            self.put(y, 1, f"/{self.filter}{FULL_CELL}   "
+                           f"enter keep {DOT} esc clear", self.ACCENT)
             return
         # every segment is a click target as well as a key hint
         if self.view == "map":
-            items = [("j/k", "move", None), ("↵", "open", None),
-                     ("←", "back", "mapup"), ("m", "list", "map"),
+            items = [("j/k", "move", None), (ENTER, "open", None),
+                     (LEFT, "back", "mapup"), ("m", "list", "map"),
                      ("d", "detail", "detail"), ("r", "rescan", "rescan"),
                      ("?", "keys", "help"), ("q", "quit", "quit")]
         else:
-            items = [("j/k", "move", None), ("↵", "open", None),
+            items = [("j/k", "move", None), (ENTER, "open", None),
                      ("e/E", "expand", "expand"), ("/", "filter", "filter"),
                      ("s", "sort", "sort"), ("m", "map", "map"),
                      ("d", "detail", "detail"), ("r", "rescan", "rescan"),
@@ -2599,7 +2799,7 @@ class Tui:
         y0, x0 = (h - bh) // 2, (w - bw) // 2
         for i in range(bh):
             self.put(y0 + i, x0, " " * bw, curses.A_REVERSE)
-        self.put(y0 + 1, x0 + 2, "andy — keys", curses.A_REVERSE | curses.A_BOLD)
+        self.put(y0 + 1, x0 + 2, f"andy {DASH} keys", curses.A_REVERSE | curses.A_BOLD)
 
         def column(lines, cx, room):
             for i, (key, desc) in enumerate(lines[:room]):
@@ -2907,7 +3107,7 @@ class Tui:
         if node is None:
             return
         if node.kind == "fold":
-            self.note("too small to open — press m for the list")
+            self.note(f"too small to open {DASH} press m for the list")
         elif node.children:
             self.map_stack.append(node)
             self.map_sel = 0
@@ -2932,7 +3132,7 @@ class Tui:
             self.m.finished = False
             self.m.started = time.time()
             self.m.phase = "rescanning"
-            self.m.disk = shutil.disk_usage(HOME)
+            self.m.disk = disk_usage()
         self.scanner = Scanner(self.m, self.m.roots,
                                include_projects=self.scanner.include_projects,
                                use_cache=False, use_walker=self.scanner.use_walker)

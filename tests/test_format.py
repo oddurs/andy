@@ -64,13 +64,15 @@ class Trimming(unittest.TestCase):
     def test_shorten_keeps_both_ends_of_a_path(self):
         out = andy.shorten("~/Code/project/node_modules", 20)
         self.assertEqual(len(out), 20)
-        self.assertIn("…", out)
-        self.assertTrue(out.startswith("~/Co"))
+        self.assertIn(andy.ELLIPSIS, out)
+        self.assertTrue(out.startswith("~/C"))
         self.assertTrue(out.endswith("modules"))
 
     def test_clip_end_keeps_the_front(self):
         # A treemap cell is identified by its leading words, so the tail goes.
-        self.assertEqual(andy.clip_end("project artifacts", 8), "project…")
+        keep = 8 - len(andy.ELLIPSIS)
+        self.assertEqual(andy.clip_end("project artifacts", 8),
+                         "project artifacts"[:keep] + andy.ELLIPSIS)
 
     def test_zero_width(self):
         self.assertEqual(andy.shorten("abc", 0), "")
@@ -84,12 +86,13 @@ class Bar(unittest.TestCase):
 
     def test_ends(self):
         self.assertEqual(andy.bar(0.0, 5), " " * 5)
-        self.assertEqual(andy.bar(1.0, 5), "█" * 5)
+        self.assertEqual(andy.bar(1.0, 5), andy.FULL_CELL * 5)
 
     def test_out_of_range_is_clamped(self):
         self.assertEqual(andy.bar(-3.0, 4), " " * 4)
-        self.assertEqual(andy.bar(9.0, 4), "█" * 4)
+        self.assertEqual(andy.bar(9.0, 4), andy.FULL_CELL * 4)
 
+    @unittest.skipUnless(andy.UNICODE, "ASCII has no eighth-cells to draw with")
     def test_eighth_precision(self):
         # a single eighth is visible rather than rounded away
         self.assertNotEqual(andy.bar(1 / 64, 8).strip(), "")
