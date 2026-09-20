@@ -1,5 +1,7 @@
 # andy
 
+[![test](https://github.com/oddurs/andy/actions/workflows/test.yml/badge.svg)](https://github.com/oddurs/andy/actions/workflows/test.yml)
+
 A read-only accounting of where developer tooling hides your disk space, on
 macOS and Linux.
 
