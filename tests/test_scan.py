@@ -237,7 +237,10 @@ class EndToEnd(unittest.TestCase):
     def test_interactive_refuses_without_a_terminal(self):
         p = self.run_andy("-i")
         self.assertEqual(p.returncode, 2)
-        self.assertIn("needs a terminal", p.stderr)
+        # on a Python with no curses the refusal says that instead, which is
+        # the more useful answer and still a refusal
+        self.assertIn("needs curses" if andy.curses is None else "needs a terminal",
+                      p.stderr)
 
     def test_version(self):
         env = dict(os.environ, HOME=self.home)

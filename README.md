@@ -37,8 +37,9 @@ running them is your decision.
 
 ## Install
 
-One file, Python 3.9+, no dependencies. `curses` and `du` are already there on
-macOS and on any Linux with coreutils.
+One file, Python 3.9+, no dependencies. It needs `du`, which is on every Unix,
+and `curses` only for `andy -i` — every other mode runs on a Python built
+without it.
 
 ```sh
 curl -o /usr/local/bin/andy \
@@ -142,7 +143,8 @@ the mouse alone entirely.
 
 ## What it looks at
 
-Around 160 known locations, and only those that exist on your machine:
+Around 170 known locations per platform, 214 across both, and only those that
+exist on your machine:
 
 - **Containers and VMs** — OrbStack, Docker Desktop, Colima, Lima, Podman,
   Rancher Desktop, minikube, Vagrant, UTM, VirtualBox, Parallels. When a Docker
@@ -155,9 +157,15 @@ Around 160 known locations, and only those that exist on your machine:
   jenv, tfenv, asdf, mise, SDKMAN, local JDKs, Go SDKs, ghcup, .NET, Bun,
   Android SDK and emulators, Flutter, Nix, PlatformIO, ESP-IDF, Emscripten,
   Unity, Unreal, Godot.
-- **Xcode and simulators** — DerivedData, simulator devices (named, not just
-  UDIDs), simulator runtimes, volumes and caches, iOS/watchOS/tvOS/macOS device
-  support, XCTest devices, archives, previews, Xcode's own cache.
+- **Xcode and simulators** — DerivedData, simulator devices (named from their
+  `device.plist`, not just UDIDs), simulator runtimes, volumes and caches,
+  iOS/watchOS/tvOS/macOS device support, XCTest devices, archives, previews,
+  Xcode's own cache.
+- **Linux system storage** — `/var/lib/flatpak`, snap revisions, rootful
+  podman, Linuxbrew, and the distro package caches: apt, pacman, dnf, zypper,
+  yay, paru. Some need root to read, and are rated accordingly.
+- **Editors on Linux too** — Neovim data, state and cache, vim-plug plugins,
+  and the XDG homes of everything above.
 - **Build and test caches** — Go build cache, Turborepo, Nx, Bazel, ccache,
   sccache, Zig, Triton, node-gyp, electron-gyp, TypeScript, Selenium,
   Playwright, Puppeteer, Cypress, Electron, pre-commit, Terraform.
@@ -222,6 +230,17 @@ and the rest — is shared, and each platform adds its own. `~/Library/...` and
 everything Xcode is tagged macOS-only; `~/.config`, `~/.local/share` and the XDG
 caches are tagged Linux. Clipboard is `pbcopy`, or `wl-copy` / `xclip` / `xsel`,
 whichever answers first; `o` opens the containing directory through `xdg-open`.
+
+**`XDG_CACHE_HOME` and friends are honoured**, on both platforms, so andy looks
+where your tools actually put things rather than where the platform suggests.
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` too. A relative value is
+ignored, as the spec requires.
+
+**It degrades instead of failing.** In a terminal that cannot encode box
+drawing — a C locale with PEP 538 coercion turned off, or an 8-bit encoding —
+andy draws the same report in ASCII rather than dying on a `UnicodeEncodeError`.
+A `HOME` that was never created, which is ordinary in a container or a systemd
+unit, costs you the volume line and nothing else.
 
 Docker differs in kind rather than in path. On macOS the daemon lives in a VM
 whose disk andy measures directly, so `docker system df` describes the same

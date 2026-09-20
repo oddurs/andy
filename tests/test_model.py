@@ -119,6 +119,53 @@ class Nesting(unittest.TestCase):
                          "huge informational")
 
 
+class Itemised(unittest.TestCase):
+    """A location whose children itemise it -- each rustup toolchain, each
+    simulator, each browser build. cairn 0017: the children's bytes used to
+    fall out of the category entirely."""
+
+    def tree(self, parent_size, *child_sizes):
+        parent = measured("rustup toolchains", "/h/.rustup/toolchains", parent_size)
+        for i, size in enumerate(child_sizes):
+            parent.children.append(
+                Node(label=f"toolchain-{i}", path=f"/h/.rustup/toolchains/t{i}",
+                     measured=size, detail=True))
+        return parent, model_of(parent)
+
+    def test_the_parent_row_shows_everything_underneath_it(self):
+        parent, m = self.tree(1000, 600, 300)
+        self.assertEqual(parent.inner, 900)
+        self.assertEqual(parent.size, 1000, "the itemised children were dropped")
+        self.assertEqual(m.total, 1000)
+
+    def test_fully_itemised_is_not_zero(self):
+        # every byte accounted for by children; the parent's own remainder is 0
+        parent, m = self.tree(1000, 700, 300)
+        self.assertEqual(parent.size, 1000)
+        self.assertEqual(m.categories[0].size, 1000,
+                         "a category lost a location whose children covered it")
+
+    def test_a_remainder_is_kept(self):
+        parent, m = self.tree(1000, 600)
+        self.assertEqual(parent.size, 1000)
+        self.assertEqual([c.size for c in parent.children], [600])
+
+    def test_itemising_does_not_change_the_total(self):
+        plain = model_of(measured("x", "/h/x", 1000))
+        _, itemised = self.tree(1000, 250, 250, 500)
+        self.assertEqual(plain.total, itemised.total)
+
+    def test_a_breakdown_is_not_counted_as_a_location(self):
+        parent, m = self.tree(1000, 600, 300)
+        self.assertEqual(m.count, 1, "each toolchain was counted as its own location")
+        self.assertTrue(m.is_location(parent))
+        self.assertFalse(any(m.is_location(c) for c in parent.children))
+
+    def test_children_still_sort_largest_first(self):
+        parent, _ = self.tree(1000, 100, 700, 200)
+        self.assertEqual([c.size for c in parent.children], [700, 200, 100])
+
+
 class Invariant(unittest.TestCase):
     """The property directly, over random trees: for every measured node,
     `inner` is the sum of the measurements of the paths nested under it."""
