@@ -345,3 +345,140 @@ class ApplyStatus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OddPaths(Tree):
+    """du's output is `size<TAB>path`, one record per line, and a path may
+    contain both. cairn 0020: a newline turned 7.0M into 17.0M."""
+
+    def build(self, name):
+        base = os.path.join(self.root, name)
+        os.makedirs(os.path.join(base, "a", "b"), exist_ok=True)
+        for rel, mb in (("top.bin", 1), (os.path.join("a", "mid.bin"), 2),
+                        (os.path.join("a", "b", "deep.bin"), 4)):
+            path = os.path.join(base, rel)
+            with open(path, "wb") as fh:
+                fh.write(b"\0" * (mb * MB))
+        return base
+
+    def assertBothEngines(self, base):
+        for engine in ENGINES:
+            (size, status), _ = measure(base, engine)
+            self.assertEqual(status, "done", engine.__name__)
+            self.assertEqual(size, du(base), engine.__name__)
+
+    def test_a_newline_in_a_directory_name(self):
+        self.assertBothEngines(self.build("we\nird"))
+
+    def test_a_newline_deeper_in_the_tree(self):
+        base = self.build("plain")
+        inner = os.path.join(base, "a", "sub\ndir")
+        os.makedirs(inner)
+        with open(os.path.join(inner, "x.bin"), "wb") as fh:
+            fh.write(b"\0" * (3 * MB))
+        self.assertBothEngines(base)
+
+    def test_a_tab_in_a_directory_name(self):
+        self.assertBothEngines(self.build("ta\tbbed"))
+
+    def test_spaces_and_non_ascii(self):
+        self.assertBothEngines(self.build("with space"))
+        self.assertBothEngines(self.build("\u043f\u0440\u043e\u0435\u043a\u0442-\u65e5\u672c"))
+
+    def test_the_fallback_is_what_ran(self):
+        """Not merely available: the mangled path must go through walk_tree."""
+        base = self.build("we\nird")
+        with mock.patch.object(andy, "walk_tree", wraps=andy.walk_tree) as spy:
+            measure(base, andy.DuMeasurer)
+        self.assertTrue(spy.called, "du's output was trusted for a path it cannot name")
+
+    def test_a_clean_tree_does_not_use_the_fallback(self):
+        base = self.build("plain")
+        with mock.patch.object(andy, "walk_tree", wraps=andy.walk_tree) as spy:
+            measure(base, andy.DuMeasurer)
+        self.assertFalse(spy.called, "du's output was fine and was thrown away")
+
+
+class SharedWalks(Tree):
+    """cairn 0021. A walk of an outer directory already reads everything
+    inside it, so a requested path within it need not be walked again."""
+
+    def setUp(self):
+        super().setUp()
+        self.fill("outer/top.bin", 1)
+        self.fill("outer/inner/a.bin", 4)
+        self.fill("outer/inner/deep/b.bin", 2)
+        self.fill("outer/other/c.bin", 3)
+        self.fill("alone/d.bin", 5)
+        self.paths = [os.path.join(self.root, p) for p in
+                      ("outer", "outer/inner", "outer/other", "alone")]
+
+    def measure_all(self, engine):
+        settled = {}
+        engine(4).run(list(self.paths),
+                      lambda u: [settled.__setitem__(p, (s, k))
+                                 for p, s, k in u if k != "running"],
+                      budget=120)
+        return settled
+
+    def test_only_the_outermost_are_walked(self):
+        outer, covered = andy.DuMeasurer.outermost(self.paths)
+        self.assertEqual(sorted(outer),
+                         sorted([os.path.join(self.root, "alone"),
+                                 os.path.join(self.root, "outer")]))
+        self.assertEqual(sorted(covered),
+                         sorted([os.path.join(self.root, "outer", "inner"),
+                                 os.path.join(self.root, "outer", "other")]))
+
+    def test_an_inner_total_matches_measuring_it_alone(self):
+        for engine in ENGINES:
+            got = self.measure_all(engine)
+            for path in self.paths:
+                self.assertEqual(got[path][0], du(path),
+                                 f"{engine.__name__}: {os.path.relpath(path, self.root)}")
+                self.assertEqual(got[path][1], "done")
+
+    def test_du_spawns_one_process_per_outer_path(self):
+        seen = []
+        real = subprocess.Popen
+
+        def spy(argv, **kw):
+            if argv[:2] == ["du", "-kx"]:
+                seen.append(argv[2])
+            return real(argv, **kw)
+
+        with mock.patch.object(andy.subprocess, "Popen", spy):
+            self.measure_all(andy.DuMeasurer)
+        self.assertEqual(sorted(seen),
+                         sorted([os.path.join(self.root, "alone"),
+                                 os.path.join(self.root, "outer")]),
+                         "a path inside another was walked again")
+
+    def test_a_sibling_prefix_is_not_containment(self):
+        # outer-2 starts with the same characters as outer but is not inside it
+        self.fill("outer-2/e.bin", 2)
+        paths = self.paths + [os.path.join(self.root, "outer-2")]
+        outer, covered = andy.DuMeasurer.outermost(paths)
+        self.assertIn(os.path.join(self.root, "outer-2"), outer)
+        self.assertNotIn(os.path.join(self.root, "outer-2"), covered)
+
+    def test_duplicates_are_asked_for_once(self):
+        outer, covered = andy.DuMeasurer.outermost(
+            [os.path.join(self.root, "alone")] * 3)
+        self.assertEqual(len(outer), 1)
+        self.assertEqual(covered, {})
+
+    def test_the_walker_does_not_share_walks(self):
+        """It accumulates one total per walk and cannot pick a subtree out of
+        it, so it measures each path on its own. The numbers still agree."""
+        self.assertFalse(andy.Walker.SHARES_WALKS)
+        self.assertTrue(andy.DuMeasurer.SHARES_WALKS)
+
+    def test_an_outer_path_that_vanished_settles_what_it_covered(self):
+        gone = os.path.join(self.root, "gone")
+        paths = [gone, os.path.join(gone, "inner")]
+        got = {}
+        andy.DuMeasurer(2).run(paths, lambda u: [got.__setitem__(p, (s, k))
+                                                 for p, s, k in u], budget=30)
+        self.assertEqual(got.get(gone), (0, "done"))
+        self.assertEqual(got.get(os.path.join(gone, "inner")), (0, "done"))

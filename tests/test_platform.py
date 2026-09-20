@@ -164,9 +164,16 @@ class Docker(unittest.TestCase):
     ROWS = [("images", 4 * 2 ** 30, "docker image prune -a", andy.REBUILD, "3 total")]
 
     def scan(self, module, tmp):
+        import shutil as _shutil
+        import tempfile
         model = module.Model()
         scanner = module.Scanner(model, [], include_projects=False, use_cache=False)
+        cache = tempfile.mkdtemp(prefix="andy-platcache-")
+        self.addCleanup(_shutil.rmtree, cache, ignore_errors=True)
         with mock.patch.object(module, "CATALOG", []), \
+             mock.patch.object(module, "CACHE_DIR", cache), \
+             mock.patch.object(module, "CACHE_FILE",
+                               os.path.join(cache, "scan.json")), \
              mock.patch.object(module, "docker_breakdown", lambda: self.ROWS):
             scanner.start()
             scanner.join(60)

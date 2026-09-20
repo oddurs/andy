@@ -157,6 +157,24 @@ def human(n: int, pad: bool = False) -> str:
     return s.rjust(5) if pad else s
 
 
+def signed(n: int) -> str:
+    """A change, with its direction: +2.1G, -840M, or a dash for none."""
+    if n == 0:
+        return "-"
+    return ("+" if n > 0 else "-") + human(abs(n))
+
+
+def ago(seconds: float) -> str:
+    """How long ago, in the roughest unit that still says something."""
+    if seconds < 0:
+        return "the future"          # a clock moved; say so rather than lie
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        count = int(seconds // size)
+        if count:
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return "moments ago"
+
+
 def tilde(path: str) -> str:
     if path == HOME:
         return "~"
@@ -302,6 +320,57 @@ class Walk:
             return self.total, self.pending <= 0
 
 
+def scan_dir(walk: Walk, path: str, stopped=lambda: False) -> tuple[int, list[str]]:
+    """One directory, du's way: its entries' allocated blocks and its subdirectories.
+
+    Shared by the Walker, which spreads directories across threads, and by
+    DuMeasurer's fallback, which walks a single tree in order when du's output
+    cannot be trusted. Keeping one copy is what keeps the two engines agreeing
+    to the byte.
+    """
+    total = 0
+    subdirs: list[str] = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if stopped():
+                    break
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue                      # vanished mid-walk
+                if st.st_dev != walk.dev:
+                    continue                      # du -x: one filesystem only
+                is_dir = st.st_mode & 0o170000 == stat.S_IFDIR
+                if not is_dir and st.st_nlink > 1:
+                    with walk.lock:
+                        if st.st_ino in walk.seen:
+                            continue              # already counted under another name
+                        walk.seen.add(st.st_ino)
+                total += st.st_blocks * 512
+                if is_dir:
+                    subdirs.append(entry.path)
+    except OSError:
+        pass                                      # unreadable: du counts nothing either
+    return total, subdirs
+
+
+def walk_tree(walk: Walk, stopped=lambda: False) -> int:
+    """Measure one tree in this process, start to finish, and return the total."""
+    try:
+        st = os.lstat(walk.root)
+    except OSError:
+        return 0
+    walk.dev = st.st_dev
+    total = st.st_blocks * 512
+    pending = [walk.root]
+    while pending and not stopped():
+        total_here, subdirs = scan_dir(walk, pending.pop(), stopped)
+        total += total_here
+        pending.extend(subdirs)
+    return total
+
+
 class Measurer:
     """Measures directories in parallel, publishing totals as they climb.
 
@@ -312,9 +381,15 @@ class Measurer:
     the work it coordinated.
     """
 
+    # A walk of an outer directory already reads every directory inside it. An
+    # engine that can pick the inner totals out of that one pass says so here,
+    # and is handed only the outermost paths.
+    SHARES_WALKS = False
+
     def __init__(self, workers: int = 8, cancel: threading.Event | None = None) -> None:
         self.workers = max(1, workers)
         self.cancel = cancel or threading.Event()
+        self.covered: dict[str, Walk] = {}   # inner path -> its Walk, filled by run()
         self._queue: deque = deque()
         self._stop = False
 
@@ -354,20 +429,53 @@ class Measurer:
         self._queue.clear()
         self._cleanup()
 
+    @staticmethod
+    def outermost(paths: list[str]) -> tuple[list[str], dict[str, str]]:
+        """Split paths into the ones to walk and the ones those walks contain.
+
+        Sorted by component so a directory always precedes everything beneath
+        it whatever its siblings are called -- the same reason Model.recompute
+        sorts that way."""
+        outer: list[str] = []
+        covered: dict[str, str] = {}
+        for path in sorted(set(paths), key=lambda p: p.split(os.sep)):
+            enclosing = next((o for o in reversed(outer)
+                              if path.startswith(o + os.sep)), None)
+            if enclosing is None:
+                outer.append(path)
+            else:
+                covered[path] = enclosing
+        return outer, covered
+
     def run(self, paths: list[str], publish, budget: float = MEASURE_BUDGET) -> None:
         """Measure every path, calling `publish` with a list of
         (path, bytes, status) once per tick. Status is "running" while the
         number is still climbing, "done" when it is exact, and "partial" when
         the budget expired and it is only a floor."""
+        if self.SHARES_WALKS:
+            to_walk, inside = self.outermost(paths)
+        else:
+            to_walk, inside = list(dict.fromkeys(paths)), {}
+
         walks: dict[str, Walk] = {}
         settled: list[tuple[str, int, str]] = []
-        for path in paths:
+        for path in inside:
+            # not walked on its own; its total is read out of the enclosing walk
+            walk = Walk(path)
+            walks[path] = walk
+            self.covered[path] = walk
+        for path in to_walk:
             walk = Walk(path)
             if self._seed(walk):
                 walks[path] = walk
-            else:
-                # gone between the catalog being built and now: no bytes, no mystery
-                settled.append((path, 0, "done"))
+                continue
+            # gone between the catalog being built and now: no bytes, no mystery
+            settled.append((path, 0, "done"))
+            for inner, enclosing in inside.items():
+                if enclosing == path:
+                    settled.append((inner, 0, "done"))
+                    walks.pop(inner, None)
+                    self.covered.pop(inner, None)
         if settled:
             publish(settled)
         if not walks:
@@ -429,6 +537,8 @@ class DuMeasurer(Measurer):
     never reported as local disk.
     """
 
+    SHARES_WALKS = True
+
     def __init__(self, workers: int = 8, cancel: threading.Event | None = None) -> None:
         super().__init__(workers, cancel)
         self._procs: set = set()
@@ -441,13 +551,17 @@ class DuMeasurer(Measurer):
         return True
 
     def _step(self, walk: Walk) -> None:
+        inside = {path: inner for path, inner in self.covered.items()
+                  if path.startswith(walk.root + os.sep)}
         proc = None
+        mangled = False
         try:
             proc = subprocess.Popen(["du", "-kx", walk.root], stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, text=True, bufsize=1)
             with self._procs_lock:
                 self._procs.add(proc)
             child: dict[str, int] = {}
+            prefix = walk.root + os.sep
             for line in proc.stdout:
                 if self._stop:
                     break
@@ -455,20 +569,52 @@ class DuMeasurer(Measurer):
                 try:
                     size = int(kb) * 1024
                 except ValueError:
-                    continue            # a warning, or a path containing a tab
+                    continue            # a warning on stdout, or a stray line
+                if path != walk.root and not path.startswith(prefix):
+                    # du -kx <root> only ever prints paths under <root>. Anything
+                    # else is half of a path containing a newline, which this
+                    # line-oriented format cannot represent. Counting the halves
+                    # would inflate the total, so stop reading and walk it here.
+                    mangled = True
+                    break
                 gain = size - child.pop(path, 0)
                 parent = os.path.dirname(path)
                 child[parent] = child.get(parent, 0) + size
                 if gain:
                     with walk.lock:
                         walk.total += gain
+                inner = inside.get(path)
+                if inner is not None:
+                    # its own line is its whole subtree, exactly what `du -skx`
+                    # of it would have said, and it lands before the outer total
+                    with inner.lock:
+                        inner.total = size
+                        inner.pending = 0
         except Exception:
             pass
         finally:
             if proc is not None:
                 self._close(proc)
+            if mangled and not self._stop:
+                self._fall_back(walk, inside)
             with walk.lock:
                 walk.pending = 0
+            for inner in inside.values():
+                with inner.lock:
+                    inner.pending = 0       # never named by du: not on this volume
+
+    def _fall_back(self, walk: Walk, inside: dict) -> None:
+        """Measure in process, for a tree du cannot describe."""
+        with walk.lock:
+            walk.total = 0
+            walk.seen.clear()
+        total = walk_tree(walk, lambda: self._stop)
+        with walk.lock:
+            walk.total = total
+        for inner in inside.values():
+            inner_total = walk_tree(inner, lambda: self._stop)
+            with inner.lock:
+                inner.total = inner_total
 
     def _close(self, proc) -> None:
         with self._procs_lock:
@@ -529,32 +675,7 @@ class Walker(Measurer):
         return True
 
     def _scan(self, walk: Walk, path: str) -> tuple[int, list[str]]:
-        """One directory: its own entries' blocks, and the subdirectories."""
-        total = 0
-        subdirs: list[str] = []
-        try:
-            with os.scandir(path) as entries:
-                for entry in entries:
-                    if self._stop:
-                        break
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue                  # vanished mid-walk
-                    if st.st_dev != walk.dev:
-                        continue                  # du -x: one filesystem only
-                    is_dir = st.st_mode & 0o170000 == stat.S_IFDIR
-                    if not is_dir and st.st_nlink > 1:
-                        with walk.lock:
-                            if st.st_ino in walk.seen:
-                                continue          # already counted under another name
-                            walk.seen.add(st.st_ino)
-                    total += st.st_blocks * 512
-                    if is_dir:
-                        subdirs.append(entry.path)
-        except OSError:
-            pass                                  # unreadable: du counts nothing either
-        return total, subdirs
+        return scan_dir(walk, path, lambda: self._stop)
 
     def _step(self, item) -> None:
         walk, path = item
@@ -1414,6 +1535,7 @@ class Node:
     blocked: bool = False           # the walk did not finish in the time it had
     partial: bool = False           # `measured` is a floor, not the whole figure
     detail: bool = False            # a breakdown of its parent, not a location
+    before: int | None = None       # what the previous scan measured here
     depth: int = 0
 
     @property
@@ -1438,6 +1560,8 @@ class Model:
         self.roots: list[str] = []
         self.disk = disk_usage()
         self.generation = 0          # bumps whenever the tree changes shape
+        self.previous_at = 0.0       # when the scan we are comparing against ran
+        self.vanished: list[tuple[str, int]] = []   # measured before, gone now
 
     # -- tree maintenance ---------------------------------------------------- #
 
@@ -1577,6 +1701,8 @@ class Scanner:
         m = self.m
         cached = load_cache() if self.use_cache else {}
         cached_sizes: dict = cached.get("sizes", {}) or {}
+        with m.lock:
+            m.previous_at = float(cached.get("ts") or 0.0)
 
         # ---- phase 1: the fixed catalog
         tasks = self._build_catalog(cached_sizes)
@@ -1646,6 +1772,13 @@ class Scanner:
             for n in m.walk():
                 if not n.blocked:
                     n.stale = False
+            # a location that was measured last time and is not here now is the
+            # most interesting kind of change, and the only one the tree cannot
+            # show, because there is no row left to put it on
+            here = {n.path for n in m.walk() if n.path}
+            m.vanished = sorted(((p, size) for p, size in cached_sizes.items()
+                                 if p not in here and size),
+                                key=lambda pair: -pair[1])
             m.recompute()
             m.finished = True
             m.elapsed = time.time() - m.started
@@ -1667,6 +1800,7 @@ class Scanner:
                             kind=spec.cat)
                 if node.path in cached_sizes:
                     node.measured = cached_sizes[node.path]
+                    node.before = cached_sizes[node.path]
                     node.stale = True
                 m.category(spec.cat).children.append(node)
                 tasks.append(node)
@@ -1683,6 +1817,7 @@ class Scanner:
                         )
                         if child.path in cached_sizes:
                             child.measured = cached_sizes[child.path]
+                            child.before = cached_sizes[child.path]
                             child.stale = True
                         node.children.append(child)
                         tasks.append(child)
@@ -1721,6 +1856,7 @@ class Scanner:
                     group.children.append(node)
                 if path in cached_sizes:
                     node.measured = cached_sizes[path]
+                    node.before = cached_sizes[path]
                     node.stale = True
                 tasks.append(node)
         return tasks
@@ -1953,6 +2089,97 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     p()
 
 
+def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
+    """What changed since the previous scan.
+
+    andy is otherwise entirely about now. This is the one place it is about
+    time, so the interval it is comparing across is stated rather than implied:
+    the cache is whenever andy last ran, which might be ten minutes or three
+    weeks, and a number without that context would be worse than no number."""
+    w = term_width()
+    p = lambda s="": print(s, file=out)
+    p()
+
+    if not m.previous_at:
+        p(f" {ink.bold('andy')}  {ink.dim('nothing to compare against yet')}")
+        p()
+        p("  This is the first scan andy has cached, so there is no previous")
+        p("  figure to subtract. Run it again later and this will have an answer.")
+        p()
+        return
+
+    when = ago(time.time() - m.previous_at)
+    p(f" {ink.bold('andy')}  {ink.dim('change since the previous scan, ' + when)}")
+    p()
+
+    grew = [n for n in m.walk() if m.is_location(n) and n.before is not None
+            and n.size != n.before]
+    fresh = [n for n in m.walk() if m.is_location(n) and n.before is None]
+    grew.sort(key=lambda n: -abs(n.size - n.before))
+    fresh.sort(key=lambda n: -n.size)
+
+    if not grew and not fresh and not m.vanished:
+        p(f"  {ink.dim('nothing has changed size since then')}")
+        p()
+        return
+
+    # Three totals, not one. A location with no previous figure may be newly
+    # created or merely newly recognised -- a catalog entry added since the last
+    # release makes bytes that were always there look like growth -- so it is
+    # counted apart from the change andy can actually vouch for.
+    changed = sum(n.size - n.before for n in grew)
+    added = sum(n.size for n in fresh)
+    removed = sum(size for _, size in m.vanished)
+
+    namew = min(max((len(n.label) for n in grew + fresh), default=10),
+                max(18, w // 3))
+    limit = top or len(grew)
+
+    def heading(word, note):
+        p(f" {ink.head(word)}  {ink.dim(note)}")
+        p()
+
+    if grew:
+        heading("changed", f"{len(grew)} location{'s' if len(grew) != 1 else ''}")
+        for n in grew[:limit]:
+            change = n.size - n.before
+            paint = ink.red if change > 0 else ink.green
+            p(f"  {paint(signed(change).rjust(7))}  "
+              f"{shorten(n.label, namew).ljust(namew)}  "
+              f"{ink.dim(human(n.before) + ' ' + RIGHT + ' ' + human(n.size))}")
+        if len(grew) > limit:
+            p(f"  {ink.dim(f'... and {len(grew) - limit} more')}")
+        p()
+
+    if fresh:
+        heading("new", f"{human(added)} in {len(fresh)} location"
+                       f"{'s' if len(fresh) != 1 else ''} andy had not measured "
+                       f"before, which may mean created or merely recognised")
+        for n in fresh[:limit]:
+            p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
+              f"{shorten(n.label, namew).ljust(namew)}  "
+              f"{ink.dim(shorten(tilde(n.path), max(10, w - namew - 14)))}")
+        if len(fresh) > limit:
+            p(f"  {ink.dim(f'... and {len(fresh) - limit} more')}")
+        p()
+
+    if m.vanished:
+        heading("gone", f"{human(removed)} in {len(m.vanished)} location"
+                        f"{'s' if len(m.vanished) != 1 else ''} measured before "
+                        f"and not there now")
+        for path, size in m.vanished[:limit]:
+            p(f"  {ink.green(('-' + human(size)).rjust(7))}  "
+              f"{ink.dim(shorten(tilde(path), w - 12))}")
+        if len(m.vanished) > limit:
+            p(f"  {ink.dim(f'... and {len(m.vanished) - limit} more')}")
+        p()
+
+    paint = ink.red if changed > 0 else ink.green
+    p(f"  {ink.bold('net')}  {paint(signed(changed))}  "
+      f"{ink.dim(f'across the {len(grew)} location' + ('s' if len(grew) != 1 else '') + ' andy could compare')}")
+    p()
+
+
 def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
     w = term_width()
     p = lambda s="": print(s, file=out)
@@ -2013,6 +2240,9 @@ def to_json(m: Model) -> dict:
             d["measured"] = bool(n.partial)
         if n.path:
             d["path"] = n.path
+        if n.before is not None:
+            d["previous_bytes"] = n.before
+            d["change_bytes"] = n.size - n.before
         if n.kind:
             d["kind"] = n.kind
         if n.cmd:
@@ -2033,6 +2263,10 @@ def to_json(m: Model) -> dict:
         "volume": {"total_bytes": total, "used_bytes": used, "free_bytes": free},
         "mapped_bytes": m.total,
         "roots": m.roots,
+        "previous_scan_at": (time.strftime("%Y-%m-%dT%H:%M:%S",
+                                           time.localtime(m.previous_at))
+                             if m.previous_at else None),
+        "vanished": [{"path": p, "previous_bytes": size} for p, size in m.vanished],
         "categories": [node(c) for c in m.categories],
     }
 
@@ -2056,6 +2290,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("-c", "--commands", action="store_true",
                     help="print the reclaim commands as a shell script (does not run them)")
     ap.add_argument("-j", "--json", action="store_true", help="print JSON")
+    ap.add_argument("-d", "--delta", action="store_true",
+                    help="what changed since the previous scan")
     ap.add_argument("-n", "--top", type=int, default=12, metavar="N",
                     help="how many largest items to list (default 12, 0 to omit)")
     ap.add_argument("-m", "--min", default="10M", metavar="SIZE",
@@ -2091,6 +2327,10 @@ def main(argv: list[str] | None = None) -> int:
 
     roots = (dedupe_dirs([os.path.expanduser(r) for r in args.roots])
              or default_roots())
+    if args.delta and args.fresh:
+        print("andy: --delta compares against the cached scan, which --fresh "
+              "ignores", file=sys.stderr)
+        return 2
 
     model = Model()
     model.roots = roots
@@ -2137,6 +2377,8 @@ def main(argv: list[str] | None = None) -> int:
             print()
         elif args.commands:
             print_commands(model, ink, min_bytes)
+        elif args.delta:
+            print_delta(model, ink, max(0, args.top))
         elif args.tree:
             print_tree(model, ink, min_bytes)
         else:
@@ -2331,17 +2573,7 @@ class Tui:
     # -- curses plumbing ----------------------------------------------------- #
 
     def setup(self) -> None:
-        # These were class attributes once, which meant the class body touched
-        # curses at import time and andy needed a terminal library to print
-        # JSON. They are resolved here instead, inside curses.wrapper.
-        #
-        # ncurses built with mouse version 1 has no BUTTON5, and misreports a
-        # wheel-down as a position report. It only ever enables xterm mode 1000,
-        # which never sends motion, so that bit is unambiguous here.
-        self.WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED",
-                                  curses.REPORT_MOUSE_POSITION)
-        self.CLICK = curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED
-        self.RIGHT_CLICK = curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED
+        self.styles()
         curses.curs_set(0)
         self.s.nodelay(True)
         self.s.keypad(True)
@@ -2352,6 +2584,27 @@ class Tui:
                 curses.mouseinterval(0)      # report presses at once, no lag
             except Exception:
                 self.use_mouse = False
+        self.styles()
+
+    def styles(self) -> None:
+        """Colour pairs, attributes and the mouse bitmasks.
+
+        Kept apart from setup() because none of it touches the terminal --
+        start_color simply raises without one, and the fallback is the same
+        monochrome path a colourless terminal takes -- so the drawing code can
+        be exercised against a screen that is not a tty.
+
+        The mouse constants were class attributes once, which made the class
+        body touch curses at import time and meant andy needed a terminal
+        library to print JSON. ncurses built with mouse version 1 has no
+        BUTTON5 and misreports a wheel-down as a position report; it only ever
+        enables xterm mode 1000, which never sends motion, so that bit is
+        unambiguous here.
+        """
+        self.WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED",
+                                  curses.REPORT_MOUSE_POSITION)
+        self.CLICK = curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED
+        self.RIGHT_CLICK = curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED
         self.colour = False
         try:
             curses.start_color()
@@ -2434,9 +2687,15 @@ class Tui:
         def visible(node: Node) -> bool:
             if not hit(node):
                 return False
-            if node.size <= 0 and not node.children:
+            if node.size <= 0 and not node.children and not node.blocked:
+                # a location whose walk never finished has no size to show and
+                # is the most worth showing: hiding it would report a disk andy
+                # could not read as a disk with nothing on it
                 return False
-            return self.show_small or filt or node.size >= self.MIN_SMALL
+            # `blocked` is not a small location, it is an unknown one, and the
+            # 10M floor is a judgement about size that andy has not got to make
+            return (self.show_small or filt or node.blocked
+                    or node.size >= self.MIN_SMALL)
 
         rows: list[tuple[Node, int, int]] = []
 
@@ -2753,7 +3012,9 @@ class Tui:
             widths = [len(k) + 1 + len(lbl) for k, lbl, _ in items]
             if 1 + sum(widths) + 3 * (len(items) - 1) <= w - 2:
                 break
-            items.pop(0) if len(items) > 6 else items.pop(4)
+            # drop from the left while there are plenty, then from the middle,
+            # clamped because the middle of a four-item list is not index four
+            items.pop(0 if len(items) > 6 else min(4, len(items) - 1))
         x = 1
         for key, label, kind in items:
             span = len(key) + 1 + len(label)
