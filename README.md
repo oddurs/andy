@@ -25,16 +25,20 @@ running them is your decision.
                          ─────
   total                  82.8G  38% of used space
 
+  of which  8.2G regenerates itself   66.5G costs you a rebuild   8.1G wants a look first
+
  largest items
 
-  28.2G  OrbStack             ~/Library/Group Containers/HUAQ24HBR6.dev.orbstack
-   7.5G  parser/target        ~/Code/parser/target
-   5.7G  rustup toolchains    ~/.rustup/toolchains
-   4.0G  engine/target        ~/Code/engine/target
-   3.8G  api/target           ~/Code/api/target
-   2.4G  other in ~/.cache    ~/.cache
-   2.4G  pnpm store           ~/Library/pnpm/store
-   2.2G  Playwright browsers  ~/Library/Caches/ms-playwright
+  28.2G  r  OrbStack             ~/Library/Group Containers/HUAQ24HBR6.dev.orbstack
+   7.5G  r  parser/target        ~/Code/parser/target
+   5.7G  !  rustup toolchains    ~/.rustup/toolchains
+   4.0G  r  engine/target        ~/Code/engine/target
+   3.8G  r  api/target           ~/Code/api/target
+   2.4G  s  other in ~/.cache    ~/.cache
+   2.4G  s  pnpm store           ~/Library/pnpm/store
+   2.2G  r  Playwright browsers  ~/Library/Caches/ms-playwright
+
+  s regenerates itself   r costs a rebuild   ! wants a look first
 ```
 
 ## Install
@@ -168,6 +172,7 @@ the mouse alone entirely.
 | `/` | filter by name or path; `esc` clears |
 | `s` | sort by size or name |
 | `a` | also show items under 10M |
+| `space` | mark this row; `C` copies every marked row as one script |
 | `c` | copy the reclaim command to the clipboard |
 | `y` | copy the path; `o` reveals it in Finder |
 | `m` | the area map; `↵` opens a cell, `←` backs out |
@@ -218,7 +223,31 @@ project with no `package.json` is somebody's data, not a cache.
 Every item carries a safety rating: **safe** regenerates itself, **rebuild** is
 fine to remove but costs you a rebuild, **review** may hold something you want.
 Editor state, vendored dependencies and anything holding model weights are
-never rated safe, whatever their name suggests.
+never rated safe, whatever their name suggests. The summary totals the three, so
+the first thing you see is how much of the pile you can actually act on.
+
+### Commands you can read and then run
+
+`andy --commands` writes the reclaim commands as a commented shell script, with
+the paths filled in — it found the directories, so it names them rather than
+leaving you a `<project>` to look up and retype.
+
+```sh
+# ---- toolchains & runtimes  7.3G -----------------------------------
+
+#   A full Rust toolchain per channel. Old nightlies add up fast.
+
+# stable-aarch64-apple-darwin  (2.1G, review)
+# rustup toolchain uninstall stable-aarch64-apple-darwin
+
+# 1.98.1-aarch64-apple-darwin  (1.3G, review)
+# rustup toolchain uninstall 1.98.1-aarch64-apple-darwin
+```
+
+Largest first, so you can stop partway down having reclaimed a known amount.
+Paths are absolute and shell-quoted, because a path with a space in it that
+splits an `rm -rf` into two arguments is the one mistake this program must never
+help you make. Every line is still commented; nothing here has been run.
 
 ## Notes
 

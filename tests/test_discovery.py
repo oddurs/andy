@@ -146,11 +146,13 @@ class Labels(Tree):
         self.assertEqual(
             andy.project_label("/r/repo/node_modules", ["/r"]), "repo/node_modules")
 
-    def test_a_long_path_is_elided_in_the_middle(self):
+    def test_a_long_path_is_kept_whole(self):
+        """cairn 0030: the label is the full relative path. How much of it fits
+        is a question about the column it lands in, and trimming it here as
+        well produced two ellipses meaning two different things."""
         label = andy.project_label("/r/a/b/c/d/e/node_modules", ["/r"])
-        self.assertIn(andy.ELLIPSIS, label)
-        self.assertTrue(label.startswith("a/b"))
-        self.assertTrue(label.endswith("node_modules"))
+        self.assertEqual(label, "a/b/c/d/e/node_modules")
+        self.assertNotIn(andy.ELLIPSIS, label)
 
     def test_a_path_outside_every_root_falls_back_to_tilde(self):
         self.assertEqual(andy.project_label("/elsewhere/x", ["/r"]), "/elsewhere/x")

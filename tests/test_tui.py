@@ -84,7 +84,7 @@ def sample_model(project_count=6):
                                 blocked=True))
 
     tools = m.category(andy.TOOLCHAINS)
-    rustup = Node(label="rustup toolchains", path="/h/rustup",
+    rustup = Node(label="rustup toolchains", path="/h/rustup", safety=andy.REVIEW,
                   measured=8 * 2 ** 30, cmd="rustup toolchain uninstall <name>")
     for name, size in (("stable", 4 * 2 ** 30), ("nightly", 3 * 2 ** 30)):
         rustup.children.append(Node(label=name, path=f"/h/rustup/{name}",
@@ -96,6 +96,7 @@ def sample_model(project_count=6):
     for i in range(project_count):
         group.children.append(Node(label=f"proj{i}/node_modules",
                                    path=f"/r/proj{i}/node_modules",
+                                   cmd="rm -rf <path>", safety=andy.REBUILD,
                                    measured=(i + 1) * 200 * MB))
     projects.children.append(group)
 
@@ -357,6 +358,154 @@ class Zones(unittest.TestCase):
         self.assertTrue(node.expanded)
         tui.toggle(0)
         self.assertFalse(node.expanded)
+
+
+@needs_curses
+class Marking(unittest.TestCase):
+    """cairn 0031. Reclaiming a disk is four or five directories across three
+    categories, and the browser could only hand over one at a time."""
+
+    def rows(self, tui):
+        return [n.label for n, _, _ in tui.rows]
+
+    def open_all(self, tui):
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        return tui
+
+    def mark(self, tui, label):
+        idx = next(i for i, (n, _, _) in enumerate(tui.rows) if n.label == label)
+        tui.cursor = idx
+        tui.handle(ord(" "))
+        tui.build_rows()
+
+    def test_space_marks_and_unmarks(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        self.assertEqual(len(tui.marked), 1)
+        self.mark(tui, "pnpm store")
+        self.assertEqual(tui.marked, set())
+
+    def test_space_no_longer_expands(self):
+        """It opened branches once; enter, tab and right still do."""
+        tui, _ = make_tui()
+        node = tui.rows[0][0]
+        tui.cursor = 0
+        tui.handle(ord(" "))
+        self.assertFalse(node.expanded, "space both marked and expanded")
+        tui.handle(ord("\n"))
+        self.assertTrue(node.expanded)
+
+    def test_a_mark_is_visible(self):
+        tui, screen = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        draw(tui)
+        line = next(screen.row(y) for y in range(screen.height)
+                    if "pnpm store" in screen.row(y))
+        self.assertIn("*", line)
+
+    def test_marks_survive_filtering_and_sorting(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        tui.filter = "rustup"
+        tui.build_rows()
+        self.assertNotIn("pnpm store", self.rows(tui))
+        tui.filter = ""
+        tui.sort_by_name = True
+        tui.build_rows()
+        self.assertEqual(len(tui.marked), 1)
+        self.assertEqual([n.label for n in tui.marked_nodes()], ["pnpm store"])
+
+    def test_marks_are_remembered_by_path_so_a_rescan_keeps_them(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        fresh = sample_model()          # as a rescan rebuilds it
+        tui.m = fresh
+        tui.build_rows()
+        self.assertEqual([n.label for n in tui.marked_nodes()], ["pnpm store"])
+
+    def test_marking_confirms_with_the_size_so_far(self):
+        tui, screen = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        draw(tui)
+        self.assertIn("marked pnpm store", screen.text())
+        self.assertIn("3.0G in 1", screen.text())
+
+    def test_the_footer_shows_what_is_marked_once_the_toast_clears(self):
+        tui, screen = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        tui.message_until = 0           # as it would be a couple of seconds on
+        draw(tui)
+        text = screen.text()
+        self.assertIn("copy 1", text)
+        self.assertIn("3.0G", text)
+
+    def test_marking_a_group_means_its_members(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "node_modules")
+        rows = andy.selected_rows(tui.m, tui.marked_nodes())
+        labels = [n.label for _, n, _ in rows]
+        self.assertTrue(labels, "a group marked nothing")
+        self.assertNotIn("node_modules", labels)
+        self.assertTrue(all("proj" in label for label in labels), labels)
+
+    def test_a_group_and_a_child_are_not_counted_twice(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "node_modules")
+        group = next(n for n, _, _ in tui.rows if n.label == "node_modules")
+        self.mark(tui, group.children[0].label)
+        self.assertEqual(tui.marked_size(), group.size)
+
+    def test_copying_builds_one_script(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "pnpm store")
+        self.mark(tui, "rustup toolchains")
+        with mock.patch.object(andy, "clip", return_value=True) as clip:
+            tui.handle(ord("C"))
+        text = clip.call_args[0][0]
+        self.assertTrue(text.startswith("#!/bin/sh"))
+        self.assertIn("pnpm store prune", text)
+        self.assertIn("rustup toolchain uninstall stable", text)
+        self.assertIn("would reclaim about", text)
+        for line in text.splitlines():
+            self.assertTrue(line == "" or line.startswith("#"), line)
+        self.assertIn("copied", tui.message)
+
+    def test_copying_nothing_says_so(self):
+        tui, _ = make_tui()
+        with mock.patch.object(andy, "clip") as clip:
+            tui.handle(ord("C"))
+        clip.assert_not_called()
+        self.assertIn("nothing marked", tui.message)
+
+    def test_marking_something_with_no_command(self):
+        tui, _ = make_tui()
+        self.open_all(tui)
+        self.mark(tui, "stuck")             # blocked, no command
+        with mock.patch.object(andy, "clip") as clip:
+            tui.handle(ord("C"))
+        clip.assert_not_called()
+        self.assertIn("no", tui.message)
+
+    def test_the_browser_copies_a_filled_command_not_a_template(self):
+        """cairn 0029 reached --commands; the clipboard is the same consumer."""
+        tui, _ = make_tui()
+        self.open_all(tui)
+        node = next(n for n, _, _ in tui.rows if n.label.startswith("proj0"))
+        tui.cursor = next(i for i, (n, _, _) in enumerate(tui.rows) if n is node)
+        node.cmd = "rm -rf <path>"
+        with mock.patch.object(andy, "clip", return_value=True) as clip:
+            tui.handle(ord("c"))
+        self.assertEqual(clip.call_args[0][0], f"rm -rf {node.path}")
 
 
 @needs_curses

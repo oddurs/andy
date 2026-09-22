@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import glob
+import io
 import json
 import os
 import plistlib
 import queue
+import shlex
 import shutil
 import stat
 import subprocess
@@ -204,6 +206,38 @@ def shorten(text: str, width: int) -> str:
         return text[:width]
     head = keep // 3
     return text[:head] + ELLIPSIS + text[len(text) - (keep - head):]
+
+
+def short_path(text: str, width: int) -> str:
+    """Trim a path by dropping whole directories out of the middle.
+
+    shorten() cuts by character, which on a path throws away the segments that
+    identify it and keeps a prefix shared with everything else on screen --
+    eight rustup toolchains all rendering as `~/.rustup...rch64-apple-darwin`.
+    The last two segments name the thing, so they are what survives.
+    """
+    text = tilde(text)
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    parts = text.split(os.sep)
+    if len(parts) > 2:
+        lead = parts[0]
+        # Keep as many trailing segments as will fit, and the leading one too
+        # when there is room for it. Tail before head: `.../0030-multi-cursor/
+        # target` says which worktree, `.worktrees/.../target` does not.
+        for keep in range(len(parts) - 1, 0, -1):
+            tail = parts[-keep:]
+            for candidate in (os.sep.join([lead, ELLIPSIS] + tail),
+                              os.sep.join([ELLIPSIS] + tail)):
+                if len(candidate) <= width:
+                    return candidate
+    # a single segment longer than the space: keep its end, which is the part
+    # that differs, rather than its beginning, which is the part that does not
+    if width <= len(ELLIPSIS):
+        return text[-width:]
+    return ELLIPSIS + text[-(width - len(ELLIPSIS)):]
 
 
 def bar(fraction: float, width: int) -> str:
@@ -717,6 +751,10 @@ SAFE = "safe"          # regenerates itself, no thought required
 REBUILD = "rebuild"    # fine to delete, but you pay a rebuild
 REVIEW = "review"      # may hold something you actually want
 
+# One character per rating, for the listings. Not the first letter: rebuild and
+# review share one, and a legend that needs a second look is worse than none.
+MARK = {SAFE: "s", REBUILD: "r", REVIEW: "!"}
+
 
 @dataclass(frozen=True)
 class Spec:
@@ -877,7 +915,7 @@ CATALOG: list[Spec] = [
     # --------------------------------------------------------- toolchains/runtimes
     S(TOOLCHAINS, "rustup toolchains", "~/.rustup/toolchains",
       "A full Rust toolchain per channel. Old nightlies add up fast.",
-      "rustup toolchain list   # then: rustup toolchain uninstall <name>",
+      "rustup toolchain uninstall <name>",
       REVIEW, expand="~/.rustup/toolchains/*"),
     S(TOOLCHAINS, "rustup downloads", "~/.rustup/downloads", "Interrupted toolchain downloads.",
       "rm -rf ~/.rustup/downloads"),
@@ -975,7 +1013,7 @@ CATALOG: list[Spec] = [
       "SwiftUI preview build cache.", "rm -rf ~/Library/Developer/Xcode/UserData/Previews"),
     S(APPLE, "Simulator runtimes", "/Library/Developer/CoreSimulator/Profiles/Runtimes",
       "System-wide simulator runtimes (one per iOS version). Needs sudo to remove.",
-      "xcrun simctl runtime list   # then: xcrun simctl runtime delete <id>", REVIEW,
+      "xcrun simctl runtime delete <id>", REVIEW,
       expand="/Library/Developer/CoreSimulator/Profiles/Runtimes/*"),
     S(APPLE, "Extra toolchains", "~/Library/Developer/Toolchains",
       "Swift development snapshots.", "", REVIEW),
@@ -1063,7 +1101,7 @@ CATALOG: list[Spec] = [
       "Swift Package Manager's shared cache and security state.", "", REBUILD),
     # ---------------------------------------------------------------- models/data
     S(MODELS, "Ollama models", "~/.ollama/models", "Local LLM weights. Tens of GB is normal.",
-      "ollama list   # then: ollama rm <model>", REVIEW, expand="~/.ollama/models/blobs"),
+      "ollama rm <model>", REVIEW, expand="~/.ollama/models/blobs"),
     S(MODELS, "Hugging Face hub", "~/.cache/huggingface", "Downloaded models and datasets.",
       "huggingface-cli delete-cache", REVIEW),
     S(MODELS, "PyTorch hub", "~/.cache/torch", "Pretrained checkpoints.", "rm -rf ~/.cache/torch",
@@ -1616,6 +1654,17 @@ class Model:
         self.total = sum(c.size for c in self.categories)
         self.count = sum(1 for n in self.walk() if self.is_location(n))
 
+    def by_safety(self) -> dict[str, int]:
+        """Mapped bytes split by how safe they are to remove.
+
+        Locations only: a group is not measured and a breakdown is its parent
+        said twice, so the three figures add up to `total` exactly."""
+        split = {SAFE: 0, REBUILD: 0, REVIEW: 0}
+        for node in self.walk():
+            if self.is_location(node):
+                split[node.safety] = split.get(node.safety, 0) + node.size
+        return split
+
     @staticmethod
     def is_location(node: Node) -> bool:
         """A place on disk andy is reporting, rather than a breakdown of one.
@@ -1940,17 +1989,21 @@ ARTIFACT_NOTES = {
     "swiftpm": "Swift Package Manager's per-project scratch state.",
 }
 
+# `<path>` is the directory andy measured. Filled in per location, so the
+# script names real directories instead of asking the reader to look them up
+# and retype them -- which is how a person ends up running rm -rf against a
+# path they guessed at.
 ARTIFACT_CMDS = {
-    "node_modules": "find <root> -name node_modules -maxdepth 4 -prune -exec rm -rf {} +",
-    "cargo/maven target": "cargo clean   # run inside the project",
-    "python venv": "rm -rf <project>/.venv   # then recreate from the lockfile",
-    "gradle (project)": "./gradlew clean",
-    "next.js": "rm -rf <project>/.next",
-    "cocoapods": "rm -rf <project>/Pods   # then: pod install",
-    "deriveddata": "rm -rf <project>/DerivedData",
-    "swift build": "swift package clean   # run inside the project",
-    "cmake": "rm -rf <project>/cmake-build-*",
-    "storybook": "rm -rf <project>/storybook-static",
+    "node_modules": "rm -rf <path>   # then: npm ci / pnpm i",
+    "cargo/maven target": "rm -rf <path>   # or `cargo clean` inside the project",
+    "python venv": "rm -rf <path>   # then recreate from the lockfile",
+    "gradle (project)": "rm -rf <path>   # or `./gradlew clean`",
+    "next.js": "rm -rf <path>",
+    "cocoapods": "rm -rf <path>   # then: pod install",
+    "deriveddata": "rm -rf <path>",
+    "swift build": "rm -rf <path>   # or `swift package clean` in the project",
+    "cmake": "rm -rf <path>",
+    "storybook": "rm -rf <path>   # then: npm run build-storybook",
     "jetbrains (project)": "",   # no command: read it before removing it
     "vendor": "",
 }
@@ -1978,10 +2031,11 @@ def project_label(path: str, roots: list[str]) -> str:
             break
     else:
         rel = tilde(path)
-    parts = rel.split(os.sep)
-    if len(parts) > 4:
-        parts = parts[:2] + [ELLIPSIS] + parts[-2:]
-    return os.sep.join(parts)
+    # Deliberately not trimmed here. This is the label everything uses -- the
+    # report, the browser, --json, --commands -- and how much of it fits is a
+    # question about the column it lands in, not about the path. Trimming twice
+    # is what produced `halide-theme...claude/.../print-sheet-ui/node_modules`.
+    return rel
 
 
 # --------------------------------------------------------------------------- #
@@ -2025,6 +2079,40 @@ def term_width(default: int = 92) -> int:
         return default
 
 
+def explain_nothing(m: Model, ink: Ink, p) -> None:
+    """Why there is nothing to show, which is four different situations.
+
+    "nothing found" covered all of them: a clean machine, roots that hold
+    nothing, a typo in a directory name, and a scan that failed. Three of those
+    have something useful to say and the first is good news, so saying which
+    one it was is most of the value here.
+    """
+    if m.phase.startswith("scan error"):
+        p(f"  {ink.red('the scan did not finish')}  {ink.dim(m.phase)}")
+        p(f"  {ink.dim('so this is not a report that nothing is there')}")
+        return
+
+    if m.roots:
+        p(f"  {ink.dim('nothing found')}")
+        p()
+        known = (f"andy knows {len(CATALOG)} places developer tools keep "
+                 f"things, and none of them exist here.")
+        p(f"  {ink.dim(known)}")
+        p(f"  {ink.dim('It also looked for build output under:')}")
+        for root in m.roots:
+            p(f"    {ink.dim(tilde(root))}")
+        advice = ("If that is not where your code lives, name the directory: "
+                  "andy ~/src")
+        p(f"  {ink.dim(advice)}")
+        return
+
+    p(f"  {ink.dim('nothing found, and no project directories to look in')}")
+    p()
+    usual = "andy looks in ~/Code, ~/Projects, ~/dev and the other usual names."
+    p(f"  {ink.dim(usual)}")
+    p(f"  {ink.dim('None of them exist here, so name yours: andy ~/src')}")
+
+
 def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     w = term_width()
     total, used, free = m.disk
@@ -2038,8 +2126,8 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
       f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
     p()
 
-    if not m.categories:
-        p(ink.dim("  nothing found"))
+    if not m.categories or not m.total:
+        explain_nothing(m, ink, p)
         return
 
     biggest = max((c.size for c in m.categories), default=1) or 1
@@ -2055,6 +2143,14 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     share = f"{m.total / used * 100:.0f}% of used space" if used else ""
     p(f"  {ink.bold('total'.ljust(labelw))}{ink.bold(human(m.total, pad=True))}  {ink.dim(share)}")
 
+    split = m.by_safety()
+    if m.total:
+        p()
+        p(f"  {ink.dim('of which')}  "
+          f"{ink.green(human(split[SAFE]))} {ink.dim('regenerates itself')}   "
+          f"{ink.yellow(human(split[REBUILD]))} {ink.dim('costs you a rebuild')}   "
+          f"{ink.red(human(split[REVIEW]))} {ink.dim('wants a look first')}")
+
     if top:
         items = sorted((n for n in m.walk() if m.is_location(n)),
                        key=lambda n: -n.size)[:top]
@@ -2064,10 +2160,16 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
         namew = max((len(n.label) for n in items), default=10)
         namew = min(namew, max(18, w // 3))
         for n in items:
-            path = tilde(n.path)
-            room = w - namew - 14
+            room = w - namew - 22
             p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
-              f"{shorten(n.label, namew).ljust(namew)}  {ink.dim(shorten(path, room))}")
+              f"{ink.safety(MARK.get(n.safety, '?'))}  "
+              f"{short_path(n.label, namew).ljust(namew)}  "
+              f"{ink.dim(short_path(n.path, room))}")
+        p()
+        legend = (f"{ink.green('s')} regenerates itself   "
+                  f"{ink.yellow('r')} costs a rebuild   "
+                  f"{ink.red('!')} wants a look first")
+        p(f"  {ink.dim(legend)}")
 
     blocked = [n for n in m.walk() if n.blocked]
     if blocked:
@@ -2152,7 +2254,7 @@ def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
             change = n.size - n.before
             paint = ink.red if change > 0 else ink.green
             p(f"  {paint(signed(change).rjust(7))}  "
-              f"{shorten(n.label, namew).ljust(namew)}  "
+              f"{short_path(n.label, namew).ljust(namew)}  "
               f"{ink.dim(human(n.before) + ' ' + RIGHT + ' ' + human(n.size))}")
         if len(grew) > limit:
             p(f"  {ink.dim(f'... and {len(grew) - limit} more')}")
@@ -2164,8 +2266,8 @@ def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
                        f"before, which may mean created or merely recognised")
         for n in fresh[:limit]:
             p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
-              f"{shorten(n.label, namew).ljust(namew)}  "
-              f"{ink.dim(shorten(tilde(n.path), max(10, w - namew - 14)))}")
+              f"{short_path(n.label, namew).ljust(namew)}  "
+              f"{ink.dim(short_path(n.path, max(10, w - namew - 14)))}")
         if len(fresh) > limit:
             p(f"  {ink.dim(f'... and {len(fresh) - limit} more')}")
         p()
@@ -2176,7 +2278,7 @@ def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
                         f"and not there now")
         for path, size in m.vanished[:limit]:
             p(f"  {ink.green(('-' + human(size)).rjust(7))}  "
-              f"{ink.dim(shorten(tilde(path), w - 12))}")
+              f"{ink.dim(short_path(path, w - 12))}")
         if len(m.vanished) > limit:
             p(f"  {ink.dim(f'... and {len(m.vanished) - limit} more')}")
         p()
@@ -2191,6 +2293,20 @@ def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
     w = term_width()
     p = lambda s="": print(s, file=out)
     p()
+    if not any(c.size >= min_bytes for c in m.categories):
+        # An empty tree means one of two quite different things, and the floor
+        # is the likelier one: the default hides everything under 10M.
+        locations = [n for n in m.walk() if m.is_location(n)]
+        if locations:
+            biggest = max(n.size for n in locations)
+            count = f"{len(locations)} location{'s' if len(locations) != 1 else ''}"
+            p(f"  {ink.dim(f'{count} found, none of them over {human(min_bytes)}')}")
+            hint = f"the largest is {human(biggest)}; try -m 0 to see everything"
+            p(f"  {ink.dim(hint)}")
+        else:
+            explain_nothing(m, ink, p)
+        p()
+        return
     for c in m.categories:
         if c.size < min_bytes:
             continue
@@ -2201,7 +2317,7 @@ def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
                 if child.size < min_bytes and not child.informational:
                     continue        # too small to show, and so is everything in it
                 pad = "  " + "  " * depth
-                label = shorten(child.label, max(20, w - len(pad) - 30))
+                label = short_path(child.label, max(20, w - len(pad) - 30))
                 p(f"{pad}{ink.magnitude(child.size, human(child.size, pad=True))}  {label}")
                 emit(child, depth + 1)
 
@@ -2209,29 +2325,122 @@ def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
         p()
 
 
-def print_commands(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
-    """Emit the reclaim commands as a commented script. Never runs anything."""
-    p = lambda s="": print(s, file=out)
+# What a placeholder stands for. The directory ones andy knows exactly; the
+# name ones are the basename of an itemised child, which is why 0016 mattered
+# here -- before it there were no children to name.
+CMD_DIR = ("<project>", "<repo>")
+CMD_NAME = ("<version>", "<name>", "<profile>", "<vm>", "<model>", "<id>", "<pkg>")
+
+
+def fill_command(cmd: str, node: Node, roots: list[str]) -> str:
+    """Put real values into a reclaim command, where andy has them.
+
+    Absolute and shell-quoted rather than tilde-shortened: this is meant to be
+    read and then pasted, and a path with a space in it that splits into two
+    arguments halfway through an `rm -rf` is the one mistake this program must
+    never help anybody make. A placeholder andy cannot fill is left standing,
+    so it still reads as something to supply.
+    """
+    if not cmd or "<" not in cmd or not node.path:
+        return cmd
+    quoted = shlex.quote(node.path)
+    cmd = cmd.replace("<path>", quoted)
+    for token in CMD_DIR:
+        cmd = cmd.replace(token, shlex.quote(os.path.dirname(node.path)))
+    if "<root>" in cmd:
+        root = next((r for r in roots if node.path.startswith(r + os.sep)),
+                    os.path.dirname(node.path))
+        cmd = cmd.replace("<root>", shlex.quote(root))
+    for token in CMD_NAME:
+        cmd = cmd.replace(token, shlex.quote(os.path.basename(node.path)))
+    return cmd
+
+
+def reclaim_rows(m: Model, min_bytes: int) -> list[tuple[Node, Node, str]]:
+    """(category, location, command) for everything worth offering."""
+    rows: list[tuple[Node, Node, str]] = []
+    for category in m.categories:
+        for node in m.walk([category]):
+            if not node.cmd or node.size < min_bytes:
+                continue
+            details = [c for c in node.children if c.detail and c.size >= min_bytes]
+            if details and any(token in node.cmd for token in CMD_NAME):
+                # the command wants a name and the children are the names
+                for child in sorted(details, key=lambda c: -c.size):
+                    rows.append((category, child, fill_command(node.cmd, child, m.roots)))
+            elif m.is_location(node):
+                rows.append((category, node, fill_command(node.cmd, node, m.roots)))
+    return rows
+
+
+def selected_rows(m: Model, nodes: list[Node],
+                  min_bytes: int = 0) -> list[tuple[Node, Node, str]]:
+    """Reclaim rows limited to `nodes` and everything underneath them.
+
+    Marking a group has to mean its members: `node_modules` is not a place on
+    disk, and a script line saying so would be the placeholder problem again.
+    """
+    wanted: set[int] = set()
+    for node in nodes:
+        for inside in m.walk([node]):
+            wanted.add(id(inside))
+    return [row for row in reclaim_rows(m, min_bytes) if id(row[1]) in wanted]
+
+
+def write_commands(m: Model, rows: list[tuple[Node, Node, str]], ink: Ink, p,
+                   headline: str) -> None:
+    """The script itself, shared by --commands and the browser's copy."""
+    total = sum(n.size for _, n, _ in rows)
     p("#!/bin/sh")
     p("# Reclaim commands suggested by andy. NOTHING here has been run.")
     p("# Read every line before you run it; some are destructive by design.")
     p(f"# generated {time.strftime('%Y-%m-%d %H:%M')}  {DOT}  {human(m.total)} mapped")
-    seen: set[str] = set()
-    for c in m.categories:
-        rows = []
-        for n in m.walk([c]):
-            if n.cmd and n.size >= min_bytes and n.cmd not in seen:
-                seen.add(n.cmd)
-                rows.append(n)
-        if not rows:
+    if not rows:
+        p(f"# {headline}")
+        return
+    p(f"# this would reclaim about {human(total)}, "
+      f"in {len(rows)} place{'s' if len(rows) != 1 else ''}")
+
+    for category in m.categories:
+        here = [(n, cmd) for c, n, cmd in rows if c is category]
+        if not here:
             continue
+        size = sum(n.size for n, _ in here)
+        title = f"{category.label}  {human(size)}"
         p()
-        p(f"# ---- {c.label} " + "-" * max(0, 60 - len(c.label)))
-        for n in sorted(rows, key=lambda n: -n.size):
-            p(f"\n# {n.label}  ({human(n.size)}, {n.safety})")
-            if n.note:
-                p(f"#   {n.note}")
-            p(f"# {n.cmd}")
+        p(f"# ---- {title} " + "-" * max(0, 62 - len(title)))
+        # Grouped by explanation, groups ordered by their largest member.
+        # Thirteen cargo targets share one note; printing it thirteen times
+        # buries the thirteen paths that are the point of the section.
+        seen: set[str] = set()
+        groups: dict[str, list[tuple[Node, str]]] = {}
+        for node, cmd in sorted(here, key=lambda pair: -pair[0].size):
+            if cmd in seen:
+                continue                # one global command, said once
+            seen.add(cmd)
+            groups.setdefault(node.note, []).append((node, cmd))
+        for note, members in sorted(groups.items(),
+                                    key=lambda kv: -kv[1][0][0].size):
+            if note:
+                p(f"\n#   {note}")
+            for node, cmd in members:
+                p(f"\n# {node.label}  ({human(node.size)}, {node.safety})")
+                p(f"# {cmd}")
+
+
+def print_commands(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
+    """Emit the reclaim commands as a commented script. Never runs anything."""
+    write_commands(m, reclaim_rows(m, min_bytes), ink,
+                   lambda s="": print(s, file=out),
+                   "nothing here is over the size floor; try -m 0")
+
+
+def script_for(m: Model, nodes: list[Node]) -> str:
+    """The same script, for the clipboard."""
+    out = io.StringIO()
+    write_commands(m, selected_rows(m, nodes), Ink(False),
+                   lambda s="": print(s, file=out), "nothing here to reclaim")
+    return out.getvalue()
 
 
 def to_json(m: Model) -> dict:
@@ -2269,6 +2478,7 @@ def to_json(m: Model) -> dict:
         "duration_seconds": round(m.elapsed, 2),
         "volume": {"total_bytes": total, "used_bytes": used, "free_bytes": free},
         "mapped_bytes": m.total,
+        "reclaimable_bytes": {name: value for name, value in m.by_safety().items()},
         "roots": m.roots,
         "previous_scan_at": (time.strftime("%Y-%m-%dT%H:%M:%S",
                                            time.localtime(m.previous_at))
@@ -2504,7 +2714,7 @@ HELP = [
         ("g / G", "first / last"),
     ]),
     ("opening", [
-        (f"{ENTER}  space  tab", "expand or collapse"),
+        (f"{ENTER}  tab", "expand or collapse"),
         (f"{RIGHT} / {LEFT}", "expand / collapse"),
         ("e / E", "expand / collapse all"),
     ]),
@@ -2513,6 +2723,10 @@ HELP = [
         ("esc", "clear the filter"),
         ("s", "sort by size or name"),
         ("a", "show items under 10M"),
+    ]),
+    ("marking", [
+        ("space", "mark or unmark this row"),
+        ("C", "copy every marked row as one script"),
     ]),
     ("using", [
         ("c", "copy the command"),
@@ -2574,6 +2788,7 @@ class Tui:
         self.map_stack: list[Node] = []
         self.map_cells: list[tuple[Node, int, int, int, int]] = []
         self.map_sel = 0
+        self.marked: set[str] = set()   # by key, so marks survive a rescan
         self.zones: list[tuple[int, int, int, str, object]] = []
         self.last_click = (0.0, -1)
 
@@ -2662,6 +2877,15 @@ class Tui:
         if n >= 100 * 2 ** 20:
             return curses.A_NORMAL
         return self.DIM
+
+    @staticmethod
+    def show_path(node: Node, pathw: int) -> bool:
+        """Whether the path column would say anything the label does not.
+
+        An itemised child is named by its own basename and sits directly under
+        the row holding its directory, so printing its path repeats the line
+        above and the label beside it at once."""
+        return bool(pathw and node.path and not node.detail)
 
     @staticmethod
     def size_text(node: Node) -> str:
@@ -2837,7 +3061,9 @@ class Tui:
             else:
                 glyph = "  "
             label = node.label if depth else node.label.upper()
-            text = shorten(indent + glyph + label, labelw)
+            mark = "*" if self.mark_key(node) in self.marked else " "
+            lead = indent + mark + glyph
+            text = lead + short_path(label, max(0, labelw - len(lead)))
 
             self.zone(y, 0, w - 1, "row", idx)
             if node.children:
@@ -2849,8 +3075,8 @@ class Tui:
             if selected:
                 self.put(y, 0, " " * (w - 1), curses.A_REVERSE)
                 self.put(y, 1, text, curses.A_REVERSE)
-                if pathw and node.path:
-                    self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw),
+                if self.show_path(node, pathw):
+                    self.put(y, 1 + labelw + 2, short_path(node.path, pathw),
                              curses.A_REVERSE)
                 self.put(y, w - sizew - bw - 2, self.size_text(node), curses.A_REVERSE)
                 self.put(y, w - bw - 1, bar(frac, bw), curses.A_REVERSE)
@@ -2860,8 +3086,8 @@ class Tui:
             if node.stale:
                 attr |= self.DIM
             self.put(y, 1, text, attr)
-            if pathw and node.path:
-                self.put(y, 1 + labelw + 2, shorten(tilde(node.path), pathw), self.DIM)
+            if self.show_path(node, pathw):
+                self.put(y, 1 + labelw + 2, short_path(node.path, pathw), self.DIM)
             self.put(y, w - sizew - bw - 2, self.size_text(node),
                      self.YELLOW if node.blocked else self.magnitude(node.size))
             self.put(y, w - bw - 1, bar(frac, bw),
@@ -2973,7 +3199,7 @@ class Tui:
                      self.RED if node.blocked else 0)
         if node.cmd:
             self.put(y0 + 4, 1, "reclaim", self.DIM)
-            self.put(y0 + 4, 9, shorten(node.cmd, w - 12), self.ACCENT)
+            self.put(y0 + 4, 9, shorten(self.command_for(node), w - 12), self.ACCENT)
             self.zone(y0 + 4, 1, w - 2, "copycmd")
         elif node.path:
             self.put(y0 + 4, 1, "reclaim", self.DIM)
@@ -3009,9 +3235,15 @@ class Tui:
                      (LEFT, "back", "mapup"), ("m", "list", "map"),
                      ("d", "detail", "detail"), ("r", "rescan", "rescan"),
                      ("?", "keys", "help"), ("q", "quit", "quit")]
+        elif self.marked:
+            items = [("space", "mark", None),
+                     ("C", f"copy {len(self.marked)} ({human(self.marked_size())})",
+                      "copymarked"),
+                     ("/", "filter", "filter"), ("m", "map", "map"),
+                     ("?", "keys", "help"), ("q", "quit", "quit")]
         else:
             items = [("j/k", "move", None), (ENTER, "open", None),
-                     ("e/E", "expand", "expand"), ("/", "filter", "filter"),
+                     ("space", "mark", None), ("/", "filter", "filter"),
                      ("s", "sort", "sort"), ("m", "map", "map"),
                      ("d", "detail", "detail"), ("r", "rescan", "rescan"),
                      ("?", "keys", "help"), ("q", "quit", "quit")]
@@ -3137,9 +3369,61 @@ class Tui:
         except Exception:
             self.note(f"could not open {FILE_MANAGER}")
 
+    @staticmethod
+    def mark_key(node: Node) -> str:
+        """What a mark remembers. A path where there is one; a group has none,
+        so its kind and label, which are unique and survive a rescan."""
+        return node.path or f"{node.kind}\x00{node.label}"
+
+    def marked_nodes(self) -> list[Node]:
+        return [n for n in self.m.walk() if self.mark_key(n) in self.marked]
+
+    def marked_size(self) -> int:
+        """Bytes the marked rows stand for, without counting any twice.
+
+        Marking a group and then something inside it is an easy thing to do by
+        accident, and a footer that added them together would overstate what
+        is about to be reclaimed.
+        """
+        nodes = self.marked_nodes()
+        inside = {id(c) for n in nodes for c in self.m.walk([n]) if c is not n}
+        return sum(n.size for n in nodes if id(n) not in inside)
+
+    def toggle_mark(self, node: Node) -> None:
+        key = self.mark_key(node)
+        if key in self.marked:
+            self.marked.discard(key)
+            self.note(f"unmarked {node.label}")
+        else:
+            self.marked.add(key)
+            self.note(f"marked {node.label}  ({human(self.marked_size())} in "
+                      f"{len(self.marked)})")
+
+    def copy_marked(self) -> None:
+        nodes = self.marked_nodes()
+        if not nodes:
+            self.note("nothing marked - press space to mark a row")
+            return
+        rows = selected_rows(self.m, nodes)
+        if not rows:
+            self.note("nothing marked has a reclaim command")
+            return
+        total = human(sum(n.size for _, n, _ in rows))
+        self.note(f"copied {len(rows)} commands, about {total}"
+                  if clip(script_for(self.m, nodes)) else "could not copy")
+
+    def command_for(self, node: Node) -> str:
+        """The command with the values filled in, as --commands prints it.
+
+        The browser is another consumer of the same thing, and a `<path>` on
+        the clipboard is worse than no command at all.
+        """
+        return fill_command(node.cmd, node, self.m.roots)
+
     def copy_cmd(self, node: Node) -> None:
         if node.cmd:
-            self.note("copied command" if clip(node.cmd) else "could not copy")
+            cmd = self.command_for(node)
+            self.note("copied command" if clip(cmd) else "could not copy")
         else:
             self.note("no command for this item")
 
@@ -3214,6 +3498,8 @@ class Tui:
             self.note("sorted by " + ("name" if self.sort_by_name else "size"))
         elif kind == "detail":
             self.detail = not self.detail
+        elif kind == "copymarked":
+            self.copy_marked()
         elif kind == "expand":
             with self.m.lock:
                 any_open = any(c.expanded for c in self.m.categories if c.children)
@@ -3285,7 +3571,9 @@ class Tui:
             self.cursor, self.top = 0, 0
         elif ch in (ord("G"), curses.KEY_END):
             self.cursor = max(0, len(self.rows) - 1)
-        elif ch in (10, 13, curses.KEY_ENTER, ord(" "), 9, curses.KEY_RIGHT):
+        elif ch == ord(" ") and node:
+            self.toggle_mark(node)
+        elif ch in (10, 13, curses.KEY_ENTER, 9, curses.KEY_RIGHT):
             if node and node.children:
                 node.expanded = not node.expanded
         elif ch == curses.KEY_LEFT:
@@ -3321,6 +3609,8 @@ class Tui:
             self.map_stack, self.map_sel = [], 0
         elif ch == ord("?"):
             self.help = True
+        elif ch == ord("C"):
+            self.copy_marked()
         elif ch == ord("c") and node:
             self.copy_cmd(node)
         elif ch == ord("y") and node:

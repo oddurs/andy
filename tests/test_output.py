@@ -7,6 +7,7 @@ prints are the numbers in the model.
 
 import io
 import json
+import shlex
 import os
 import unittest
 from unittest import mock
@@ -118,12 +119,70 @@ class Rendering(unittest.TestCase):
         self.assertEqual(text.count("pnpm store prune"), 1)
 
 
+class Reclaimable(unittest.TestCase):
+    """cairn 0028. The rating was decision support printed everywhere except
+    where the decision gets made."""
+
+    def setUp(self):
+        self.m = sample_model()
+
+    def test_the_split_adds_up_to_what_was_mapped(self):
+        split = self.m.by_safety()
+        self.assertEqual(sum(split.values()), self.m.total)
+
+    def test_groups_and_breakdowns_are_not_counted_twice(self):
+        m = andy.Model()
+        cat = m.category(andy.TOOLCHAINS)
+        parent = Node(label="rustup", path="/h/r", measured=1000, safety=andy.REVIEW)
+        parent.children.append(Node(label="stable", path="/h/r/s", measured=1000,
+                                    safety=andy.REVIEW, detail=True))
+        cat.children.append(parent)
+        m.recompute()
+        self.assertEqual(m.by_safety()[andy.REVIEW], 1000)
+        self.assertEqual(sum(m.by_safety().values()), m.total)
+
+    def test_the_report_states_it(self):
+        out = io.StringIO()
+        andy.print_report(self.m, andy.Ink(False), 12, out=out)
+        text = out.getvalue()
+        self.assertIn("of which", text)
+        self.assertIn("regenerates itself", text)
+        self.assertIn("costs you a rebuild", text)
+        self.assertIn("wants a look first", text)
+
+    def test_every_largest_item_carries_its_rating(self):
+        out = io.StringIO()
+        andy.print_report(self.m, andy.Ink(False), 12, out=out)
+        text = out.getvalue()
+        self.assertIn("s regenerates itself", text)     # the legend
+        body = text[text.index("largest items"):]
+        for line in body.splitlines():
+            if "OrbStack" in line or "pnpm store" in line:
+                self.assertRegex(line, r"\s[sr!]\s", line)
+
+    def test_the_marks_are_distinct(self):
+        """safe, rebuild and review: two of them start with the same letter."""
+        self.assertEqual(len(set(andy.MARK.values())), 3)
+
+    def test_nothing_promises_a_deletion(self):
+        out = io.StringIO()
+        andy.print_report(self.m, andy.Ink(False), 12, out=out)
+        text = out.getvalue().lower()
+        for word in ("will delete", "deleting", "freed", "reclaimed "):
+            self.assertNotIn(word, text)
+
+    def test_an_empty_model_has_an_empty_split(self):
+        self.assertEqual(sum(andy.Model().by_safety().values()), 0)
+
+
 class Json(unittest.TestCase):
     def setUp(self):
         self.doc = json.loads(json.dumps(andy.to_json(sample_model())))
 
     def test_shape(self):
         self.assertEqual(self.doc["version"], andy.VERSION)
+        self.assertEqual(sum(self.doc["reclaimable_bytes"].values()),
+                         self.doc["mapped_bytes"])
         self.assertEqual(self.doc["mapped_bytes"], 16 * 2 ** 30)
         self.assertEqual(self.doc["roots"], ["/r"])
         self.assertIn("volume", self.doc)
@@ -169,3 +228,189 @@ class Json(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReclaimCommands(unittest.TestCase):
+    """cairn 0029. andy knew every path and printed `<project>` anyway."""
+
+    def model(self):
+        m = andy.Model()
+        m.roots = ["/r"]
+        projects = m.category(andy.PROJECTS)
+        group = Node(label="cargo/maven target", kind="cargo/maven target",
+                     note="Compiled Rust output.", cmd="rm -rf <path>",
+                     safety=andy.REBUILD)
+        for name, size in (("big", 5 * 2 ** 30), ("small", 2 * 2 ** 30),
+                           ("with space", 2 ** 30)):
+            group.children.append(Node(label=f"{name}/target",
+                                       path=f"/r/{name}/target", measured=size,
+                                       note=group.note, cmd=group.cmd,
+                                       safety=andy.REBUILD))
+        projects.children.append(group)
+
+        tools = m.category(andy.TOOLCHAINS)
+        rustup = Node(label="rustup toolchains", path="/h/rustup",
+                      measured=3 * 2 ** 30, safety=andy.REVIEW,
+                      note="One per channel.",
+                      cmd="rustup toolchain uninstall <name>")
+        for name, size in (("stable", 2 * 2 ** 30), ("nightly", 2 ** 30)):
+            rustup.children.append(Node(label=name, path=f"/h/rustup/{name}",
+                                        measured=size, detail=True,
+                                        safety=andy.REVIEW,
+                                        cmd=rustup.cmd, note=rustup.note))
+        tools.children.append(rustup)
+
+        caches = m.category(andy.PACKAGES)
+        caches.children.append(Node(label="pnpm store", path="/h/pnpm",
+                                    measured=2 ** 30, cmd="pnpm store prune",
+                                    note="Shared store.", safety=andy.SAFE))
+        m.recompute()
+        return m
+
+    def render(self, m, min_bytes=0):
+        out = io.StringIO()
+        andy.print_commands(m, andy.Ink(False), min_bytes, out=out)
+        return out.getvalue()
+
+    def test_a_group_becomes_its_members(self):
+        text = self.render(self.model())
+        self.assertIn("/r/big/target", text)
+        self.assertIn("/r/small/target", text)
+        self.assertNotIn("<path>", text)
+
+    def test_members_are_largest_first(self):
+        text = self.render(self.model())
+        self.assertLess(text.index("/r/big/target"), text.index("/r/small/target"))
+
+    def test_a_name_placeholder_becomes_the_itemised_children(self):
+        text = self.render(self.model())
+        self.assertIn("rustup toolchain uninstall stable", text)
+        self.assertIn("rustup toolchain uninstall nightly", text)
+        self.assertNotIn("<name>", text)
+
+    def test_a_path_with_a_space_is_quoted(self):
+        text = self.render(self.model())
+        self.assertIn("'/r/with space/target'", text,
+                      "an unquoted space would split the rm into two arguments")
+
+    def test_a_global_command_is_said_once(self):
+        text = self.render(self.model())
+        self.assertEqual(text.count("pnpm store prune"), 1)
+
+    def test_a_shared_note_is_said_once(self):
+        text = self.render(self.model())
+        self.assertEqual(text.count("Compiled Rust output."), 1,
+                         "the explanation buried the paths it was explaining")
+
+    def test_the_totals_are_printed(self):
+        text = self.render(self.model())
+        self.assertIn("would reclaim about", text)
+        self.assertRegex(text, r"# ---- project artifacts\s+8\.0G")
+
+    def test_every_line_is_still_inert(self):
+        for line in self.render(self.model()).splitlines():
+            self.assertTrue(line == "" or line.startswith("#"), line)
+
+    def test_a_floor_above_everything_says_so(self):
+        text = self.render(self.model(), min_bytes=100 * 2 ** 40)
+        self.assertIn("nothing here is over the size floor", text)
+
+    def test_a_placeholder_andy_cannot_fill_is_left_standing(self):
+        m = andy.Model()
+        m.category(andy.TOOLCHAINS).children.append(
+            Node(label="asdf", path="/h/asdf", measured=2 ** 30,
+                 cmd="asdf uninstall <plugin> <version>"))
+        m.recompute()
+        text = self.render(m)
+        self.assertIn("<plugin>", text, "a value andy does not have was invented")
+
+
+class FillCommand(unittest.TestCase):
+    def node(self, path):
+        return Node(label="x", path=path, measured=1)
+
+    def test_the_measured_directory(self):
+        self.assertEqual(andy.fill_command("rm -rf <path>", self.node("/a/b"), []),
+                         "rm -rf /a/b")
+
+    def test_the_directory_holding_it(self):
+        self.assertEqual(
+            andy.fill_command("rm -rf <project>/.next", self.node("/a/b/.next"), []),
+            "rm -rf /a/b/.next")
+
+    def test_the_scan_root(self):
+        self.assertEqual(
+            andy.fill_command("find <root>", self.node("/r/p/node_modules"), ["/r"]),
+            "find /r")
+
+    def test_the_name(self):
+        self.assertEqual(
+            andy.fill_command("nvm uninstall <version>", self.node("/h/.nvm/v20"), []),
+            "nvm uninstall v20")
+
+    def test_a_command_with_nothing_to_fill(self):
+        self.assertEqual(andy.fill_command("pnpm store prune", self.node("/a"), []),
+                         "pnpm store prune")
+
+    def test_a_node_with_no_path_is_left_alone(self):
+        self.assertEqual(andy.fill_command("rm -rf <path>", Node(label="x"), []),
+                         "rm -rf <path>")
+
+    def test_quoting_covers_the_characters_that_break_a_command(self):
+        for awkward in ("/a/with space/t", "/a/semi;colon/t", "/a/new\nline/t",
+                        "/a/dollar$sign/t"):
+            out = andy.fill_command("rm -rf <path>", self.node(awkward), [])
+            self.assertEqual(shlex.split(out), ["rm", "-rf", awkward], out)
+
+
+class NothingFound(unittest.TestCase):
+    """cairn 0032. One dead end covered four situations, three of which have
+    something useful to say and the first of which is good news."""
+
+    def render(self, m, fn=None, arg=12):
+        out = io.StringIO()
+        (fn or andy.print_report)(m, andy.Ink(False), arg, out=out)
+        return out.getvalue()
+
+    def test_a_clean_machine_with_no_project_directories(self):
+        m = andy.Model()
+        text = self.render(m)
+        self.assertIn("no project directories to look in", text)
+        self.assertIn("andy ~/src", text)
+
+    def test_roots_that_hold_nothing_are_named(self):
+        m = andy.Model()
+        m.roots = ["/home/someone/src", "/home/someone/work"]
+        text = self.render(m)
+        self.assertIn("/home/someone/src", text)
+        self.assertIn("/home/someone/work", text)
+        self.assertIn("name the directory", text)
+
+    def test_a_failed_scan_is_not_reported_as_an_empty_one(self):
+        m = andy.Model()
+        m.phase = "scan error: permission denied"
+        text = self.render(m)
+        self.assertIn("did not finish", text)
+        self.assertIn("permission denied", text)
+        self.assertNotIn("nothing found", text)
+
+    def test_a_tree_hidden_entirely_by_the_floor_says_so(self):
+        m = andy.Model()
+        m.category(andy.PACKAGES).children.append(
+            Node(label="small", path="/h/s", measured=40 * 1024))
+        m.recompute()
+        text = self.render(m, andy.print_tree, 10 * 2 ** 20)
+        self.assertIn("none of them over 10.0M", text)
+        self.assertIn("40.0K", text)
+        self.assertIn("-m 0", text)
+
+    def test_one_location_is_singular(self):
+        m = andy.Model()
+        m.category(andy.PACKAGES).children.append(
+            Node(label="small", path="/h/s", measured=1024))
+        m.recompute()
+        self.assertIn("1 location found", self.render(m, andy.print_tree, 2 ** 20))
+
+    def test_an_empty_tree_with_nothing_at_all_explains_that_instead(self):
+        text = self.render(andy.Model(), andy.print_tree, 2 ** 20)
+        self.assertIn("nothing found", text)

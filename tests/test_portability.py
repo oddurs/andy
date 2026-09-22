@@ -212,6 +212,21 @@ class Glyphs(unittest.TestCase):
         for fraction in (0.0, 0.1, 0.5, 0.99, 1.0):
             self.assertEqual(len(m.bar(fraction, 12)), 12, fraction)
 
+    def test_no_f_string_expression_spans_a_line(self):
+        """An expression inside an f-string could not span lines until Python
+        3.12, and andy supports 3.9. It is a SyntaxError, so the file does not
+        import at all -- which is how it shipped broken in 1.0 (cairn 0012) and
+        how I reintroduced it while writing 0032. CI catches it on the 3.9 job;
+        this catches it before the push."""
+        import ast
+        with open(ANDY, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        spans = [part.value.lineno
+                 for node in ast.walk(tree) if isinstance(node, ast.JoinedStr)
+                 for part in node.values if isinstance(part, ast.FormattedValue)
+                 and part.value.end_lineno != part.value.lineno]
+        self.assertEqual(spans, [], f"f-string expressions spanning lines: {spans}")
+
     def test_no_drawing_character_is_written_inline(self):
         """Every glyph goes through the table, so both sets stay in step."""
         with open(ANDY, encoding="utf-8") as fh:
