@@ -48,12 +48,15 @@ and `curses` only for `andy -i` — every other mode runs on a Python built
 without it.
 
 ```sh
-curl -o /usr/local/bin/andy \
-  https://raw.githubusercontent.com/oddurs/andy/main/andy
-chmod +x /usr/local/bin/andy
+curl -fLo ~/.local/bin/andy \
+  https://github.com/oddurs/andy/releases/latest/download/andy
+chmod +x ~/.local/bin/andy
 ```
 
-Or clone and symlink it wherever you keep things:
+That is the latest release, not whatever is on `main` this afternoon. A
+specific version is `.../releases/download/v2.0.0/andy`.
+
+Or clone and symlink it wherever you keep things, which follows `main`:
 
 ```sh
 git clone https://github.com/oddurs/andy.git
