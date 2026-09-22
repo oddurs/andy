@@ -118,7 +118,7 @@ class Ink(unittest.TestCase):
     def test_disabled_ink_is_the_identity(self):
         ink = andy.Ink(False)
         self.assertEqual(ink.red("x"), "x")
-        self.assertEqual(ink.magnitude(2 ** 40, "x"), "x")
+        self.assertEqual(ink.safety(andy.SAFE), andy.SAFE)
 
     def test_enabled_ink_wraps_and_resets(self):
         ink = andy.Ink(True)
