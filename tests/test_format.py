@@ -128,3 +128,54 @@ class Ink(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShortPath(unittest.TestCase):
+    """cairn 0030. A path is trimmed by dropping whole directories, because
+    the middle is what identifies it and the head is shared with its neighbours."""
+
+    def test_short_enough_is_left_alone(self):
+        self.assertEqual(andy.short_path("~/Code/rsst/target", 40), "~/Code/rsst/target")
+
+    def test_it_never_exceeds_the_width(self):
+        cases = ["~/Library/Group Containers/HUAQ24HBR6.dev.orbstack",
+                 "~/.rustup/toolchains/stable-aarch64-apple-darwin",
+                 "a/b/c/d/e/f/node_modules", "/one-very-long-single-segment-here",
+                 "short", ""]
+        for text in cases:
+            for width in range(0, 60):
+                self.assertLessEqual(len(andy.short_path(text, width)), width,
+                                     f"{text!r} at {width}")
+
+    def test_the_identifying_tail_survives(self):
+        out = andy.short_path("~/.rustup/toolchains/stable-aarch64-apple-darwin", 30)
+        self.assertTrue(out.endswith("stable-aarch64-apple-darwin"), out)
+
+    def test_paths_differing_only_in_the_middle_stay_different(self):
+        """The failure this exists for: eight toolchains rendering identically."""
+        a = andy.short_path("~/.rustup/toolchains/1.98.1-aarch64-apple-darwin", 30)
+        b = andy.short_path("~/.rustup/toolchains/1.93.1-aarch64-apple-darwin", 30)
+        self.assertNotEqual(a, b)
+
+    def test_the_tail_is_preferred_over_the_head(self):
+        out = andy.short_path(".worktrees/nun/feat/0030-multi-cursor/target", 30)
+        self.assertIn("0030-multi-cursor", out,
+                      "the branch name is what tells the worktrees apart")
+
+    def test_the_head_is_kept_when_there_is_room(self):
+        out = andy.short_path("~/Library/Group Containers/HUAQ24HBR6.dev.orbstack", 30)
+        self.assertTrue(out.startswith("~/"), out)
+
+    def test_it_elides_by_segment_not_by_character(self):
+        out = andy.short_path("~/a/bbbbbbbbbb/cccccccccc/dddddddddd/target", 24)
+        for piece in out.replace(andy.ELLIPSIS, "/").split("/"):
+            self.assertIn(piece, ["", "~", "a", "bbbbbbbbbb", "cccccccccc",
+                                  "dddddddddd", "target"],
+                          f"{piece!r} is half a directory name")
+
+    def test_a_single_segment_keeps_its_end(self):
+        out = andy.short_path("/aaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail", 12)
+        self.assertTrue(out.endswith("tail"), out)
+
+    def test_home_is_still_abbreviated(self):
+        self.assertTrue(andy.short_path(andy.HOME + "/Code", 40).startswith("~/"))

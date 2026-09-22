@@ -51,3 +51,17 @@ Faster, honest about change, and tested where it is least tested.
 - [x] `0025` The browser hides the locations it could not measure <sup>bug · p1</sup>
 - [x] `0026` du output is decoded with the locale encoding, not the filesystem one <sup>bug · p0</sup>
 
+## v1.4 — v1.4
+
+`##########` 100% · 5 of 5 done · due 2027-03-15
+
+From inventory to decision.
+
+### done
+
+- [x] `0028` The report never says how much you could get back <sup>feature · p0</sup>
+- [x] `0029` Reclaim commands are not ready to run <sup>feature · p1</sup>
+- [x] `0030` Paths are elided where the information is <sup>bug · p1</sup>
+- [x] `0031` The browser cannot act on more than one thing <sup>feature · p2</sup>
+- [x] `0032` A machine with nothing on it is a dead end <sup>chore · p2</sup>
+
