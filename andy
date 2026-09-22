@@ -2071,7 +2071,7 @@ THEMES: dict[str, dict[str, str]] = {
     # dark, whatever the user has chosen. The map is outlined rather than
     # shaded, because a shade would have to be a colour andy picked.
     "terminal": {"heading": "bold", "content": "", "supporting": "dim",
-                 "interactive": "cyan", "selected": "reverse",
+                 "interactive": "cyan", "selected": "on surface bold",
                  SAFE: "green", REBUILD: "yellow", REVIEW: "red",
                  "map": "outline"},
     # No colour at all: what NO_COLOR gives you, chosen on purpose. Every
@@ -2090,13 +2090,149 @@ THEMES: dict[str, dict[str, str]] = {
 DEFAULT_THEME = "terminal"
 
 
+# The cursor is the one place a background is painted, and even there it is a
+# colour the user chose: andy asks the terminal what it is drawing with and
+# lifts the cursor row onto whichever of these palette slots sits closest to
+# the background while keeping text readable -- a dark theme's ANSI 0, a light
+# theme's ANSI 15, whichever the theme's author made the gentle one.
+SURFACE_SLOTS = (0, 8, 7, 15)
+VISIBLE = 1.12        # the band must be distinguishable from the background
+READABLE = 4.5        # and text on it must pass WCAG AA
+
+
+def parse_osc_replies(data: bytes) -> dict:
+    """Terminal colour replies -> {"fg": rgb, "bg": rgb, slot: rgb}."""
+    out: dict = {}
+    pattern = (rb"\033\](\d+)(?:;(\d+))?;rgb:([0-9a-fA-F]{1,4})/"
+               rb"([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})")
+    for m in re.finditer(pattern, data):
+        code, index, *parts = m.groups()
+        rgb = tuple(round(int(p, 16) / (16 ** len(p) - 1) * 255) for p in parts)
+        if code == b"10":
+            out["fg"] = rgb
+        elif code == b"11":
+            out["bg"] = rgb
+        elif code == b"4" and index is not None:
+            out[int(index)] = rgb
+    return out
+
+
+def query_terminal(timeout: float = 0.25) -> dict:
+    """Ask the terminal what colours it is really drawing with.
+
+    OSC 10 and 11 for the foreground and background, OSC 4 for the palette
+    slots, and a DA1 request last as a sentinel: every terminal answers DA1,
+    so its reply means the others have either arrived or are not coming, and
+    andy never waits out the timeout on a terminal that answers promptly.
+    Ghostty answers; so does herdr, on Ghostty's behalf. A terminal that says
+    nothing costs a quarter of a second and gets reverse video.
+    """
+    try:
+        import select as _select
+        import termios
+        import tty
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except Exception:
+        return {}
+    data = b""
+    try:
+        saved = termios.tcgetattr(fd)
+    except Exception:
+        os.close(fd)
+        return {}
+    try:
+        tty.setraw(fd)
+        asks = "\033]10;?\033\\\033]11;?\033\\" + "".join(
+            f"\033]4;{slot};?\033\\" for slot in SURFACE_SLOTS)
+        os.write(fd, (asks + "\033[c").encode())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready, _, _ = _select.select([fd], [], [], max(0.0, deadline - time.time()))
+            if not ready:
+                break
+            data += os.read(fd, 4096)
+            if re.search(rb"\033\[\?[\d;]*c", data):
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            # TCSAFLUSH also discards any reply that limps in late, so it can
+            # never turn up later as a keypress
+            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+        except Exception:
+            pass
+        os.close(fd)
+    return parse_osc_replies(data)
+
+
+def luminance(rgb: tuple) -> float:
+    """WCAG relative luminance."""
+    def channel(c: int) -> float:
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = rgb
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def contrast(a: tuple, b: tuple) -> float:
+    light, dark = sorted((luminance(a), luminance(b)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
+
+
+def choose_surface(colours: dict) -> tuple | None:
+    """(band slot, text colour) for the cursor row, from the terminal's own
+    palette -- or None, which means reverse video.
+
+    The band is the subtlest palette slot that is visibly off the background
+    and still carries readable text. The text on it is whichever of the
+    theme's own colours reads best there: the brightest white on a dark band,
+    the foreground on a light one.
+    """
+    fg, bg = colours.get("fg"), colours.get("bg")
+    if not fg or not bg:
+        return None
+    passing = [(contrast(colours[slot], bg), slot) for slot in SURFACE_SLOTS
+               if colours.get(slot)
+               and contrast(colours[slot], bg) >= VISIBLE
+               and contrast(fg, colours[slot]) >= READABLE]
+    if not passing:
+        return None
+    band = min(passing)[1]
+    candidates = [("default", fg)] + [(slot, colours[slot]) for slot in (15, 0)
+                                      if slot != band and colours.get(slot)]
+    text = max(candidates, key=lambda pair: contrast(pair[1], colours[band]))[0]
+    return band, text
+
+
+def style_background(spec: str):
+    """The `on X` part of a style: None, a palette index, or "surface"."""
+    words = (spec or "").lower().split()
+    for i, word in enumerate(words[:-1]):
+        if word == "on":
+            target = words[i + 1]
+            if target == "surface":
+                return "surface"
+            colour, _, problems = parse_style(target)
+            return None if problems else colour
+    return None
+
+
 def parse_style(spec: str) -> tuple[int | None, frozenset, list[str]]:
     """"bright-red bold" -> (colour index or None for the default, attributes,
     anything that could not be understood)."""
     colour: int | None = None
     attrs: set[str] = set()
     problems: list[str] = []
-    for word in (spec or "").lower().replace(",", " ").split():
+    words = (spec or "").lower().replace(",", " ").split()
+    skip = False
+    for i, word in enumerate(words):
+        if skip:
+            skip = False
+            continue
+        if word == "on" and i + 1 < len(words):
+            skip = True             # a background: style_background reads it
+            continue
         if word in STYLE_ATTRS:
             attrs.add(word)
         elif word in ("normal", "plain", "none", "default"):
@@ -2158,6 +2294,13 @@ def resolve_theme(name: str, custom: dict | None = None) -> tuple[dict[str, str]
             continue
         _, attrs, bad = parse_style(table[key])
         problems.extend(f"theme {name!r}, {key}: {p}" for p in bad)
+        if style_background(table[key]) is not None and key != "selected":
+            problems.append(f"theme {name!r}, {key}: only the cursor may have a "
+                            f"background, so it was dropped")
+            words = table[key].split()
+            table[key] = " ".join(w for i, w in enumerate(words)
+                                  if w.lower() != "on"
+                                  and not (i and words[i - 1].lower() == "on"))
         if "reverse" in attrs and key != "selected":
             # the design language: reverse is the cursor and only the cursor
             problems.append(f"theme {name!r}, {key}: reverse is reserved for the "
@@ -3167,9 +3310,11 @@ class Tui:
     MIN_SMALL = 10 * 2 ** 20     # hidden unless 'a'
 
     def __init__(self, stdscr, model: Model, scanner: Scanner,
-                 use_mouse: bool = True, theme: dict[str, str] | None = None) -> None:
+                 use_mouse: bool = True, theme: dict[str, str] | None = None,
+                 terminal: dict | None = None) -> None:
         self.s = stdscr
         self.theme = theme or resolve_theme(DEFAULT_THEME)[0]
+        self.terminal = terminal or {}      # what the terminal said it draws with
         self.m = model
         self.scanner = scanner
         self.cursor = 0
@@ -3261,8 +3406,13 @@ class Tui:
         return self._roles["interactive"]
 
     def selected(self) -> int:
-        """The cursor, and nothing else."""
+        """The cursor, and nothing else: the text of the row under it."""
         return self._roles["selected"]
+
+    def lift(self, role: str) -> int:
+        """Another role, drawn on the cursor's band. A mark stays its own
+        colour on the cursor row rather than turning into a solid block."""
+        return self._lifted.get(role, self._roles["selected"])
 
     def consequence(self, safety: str) -> int:
         """What removing it would cost. The only use of the warm scale."""
@@ -3334,6 +3484,51 @@ class Tui:
                 for name in parse_style(mono.get(role, ""))[1]:
                     attr |= bits[name]
             self._roles[role] = attr
+
+        # The cursor. Reverse video swaps foreground and background, which on
+        # a carefully built theme is a pale slab across the screen with every
+        # coloured mark on the row turned into a solid block. A band is what a
+        # theme's own tools use -- nvim's PmenuSel, tmux's mode-style -- so when
+        # the theme asks for `on surface` and the terminal says what it draws
+        # with, the row is lifted onto the gentlest slot of the user's palette
+        # and every column keeps its own colour on it.
+        band, text = None, None
+        wanted = style_background(self.theme.get("selected", ""))
+        if wanted == "surface":
+            found = choose_surface(self.terminal)
+            if found:
+                band, text = found
+        elif isinstance(wanted, int):
+            band, text = wanted, "default"
+        _, cursor_attrs, _ = parse_style(self.theme.get("selected", ""))
+        self._lifted = {}
+        if band is not None and band < colours:
+            for offset, role in enumerate(ROLE_NAMES):
+                colour, attrs, _ = parse_style(self.theme.get(role, ""))
+                if role == "selected":
+                    colour, attrs = (None if text == "default" else text), cursor_attrs
+                attr = curses.A_NORMAL
+                for name in attrs:
+                    if name != "reverse":
+                        attr |= bits[name]
+                try:
+                    curses.init_pair(30 + offset,
+                                     -1 if colour is None or colour >= colours else colour,
+                                     band)
+                    attr |= curses.color_pair(30 + offset)
+                except curses.error:
+                    pass
+                self._lifted[role] = attr
+            self._roles["selected"] = self._lifted["selected"]
+        else:
+            # no band available: reverse video, as before, for every column
+            fallback = curses.A_REVERSE
+            for name in cursor_attrs:
+                if name not in ("reverse",):
+                    fallback |= bits[name]
+            self._roles["selected"] = fallback
+            self._lifted = {role: curses.A_REVERSE for role in ROLE_NAMES}
+        self.band = band
 
         if self.theme.get("map") == "shade" and colours >= 256:
             for k, (bg, fg) in enumerate(MAP_RAMP):
@@ -3595,14 +3790,14 @@ class Tui:
             frac = node.size / peak if peak else 0.0
 
             if selected:
-                self.put(y, 0, " " * (w - 1), self.selected())
+                self.put(y, 0, " " * (w - 1), self.lift("content"))
                 self.put(y, 1, text, self.selected())
                 if pathw:
                     self.put(y, 1 + labelw + 2,
                              short_path(self.path_text(node), pathw),
-                             self.selected())
+                             self.lift("supporting"))
                 self.put(y, w - sizew - bw - 2 - markw, self.safety_text(node),
-                         self.selected())
+                         self.lift(node.safety))
                 self.put(y, w - sizew - bw - 2, self.size_text(node), self.selected())
                 self.put(y, w - bw - 1, bar(frac, bw), self.selected())
                 continue
@@ -3679,11 +3874,12 @@ class Tui:
         """A shaded cell, or the selected one. The shade is only used by a
         theme that asked for it; reverse is only ever the selection."""
         if selected:
-            fill |= self.selected()
+            fill = self.lift("content")
         for r in range(dh):
             self.put(y + r, x, " " * dw, fill)
         if dw >= 4:
-            self.put(y, x + 1, clip_end(node.label, dw - 2), fill | self.heading())
+            self.put(y, x + 1, clip_end(node.label, dw - 2),
+                     self.selected() if selected else fill | self.heading())
         if dh >= 2 and dw >= 5:
             self.put(y + 1, x + 1, clip_end(human(node.size), dw - 2), fill)
         if dh >= 3 and dw >= 12 and share:
@@ -3727,7 +3923,11 @@ class Tui:
         for i in range(body):
             self.zone(y0 + i, 0, 0, "scroll", i)
             if top <= i < top + height:
-                self.put(y0 + i, 0, SCROLLBAR, self.interactive())
+                # on the cursor row the thumb sits on the band, so the band
+                # runs to the edge instead of starting one column in
+                on_cursor = self.top + i == self.cursor
+                self.put(y0 + i, 0, SCROLLBAR,
+                         self.lift("interactive") if on_cursor else self.interactive())
 
     def parent_of(self, target: Node) -> Node | None:
         stack = list(self.m.categories)
@@ -4311,8 +4511,11 @@ class Tui:
 def run_tui(model: Model, scanner: Scanner, use_mouse: bool = True,
             theme: dict[str, str] | None = None, detail: bool = True,
             notice: str = "") -> None:
+    wants = style_background((theme or THEMES[DEFAULT_THEME]).get("selected", ""))
+    terminal = query_terminal() if wants == "surface" else {}
+
     def inner(stdscr):
-        tui = Tui(stdscr, model, scanner, use_mouse, theme)
+        tui = Tui(stdscr, model, scanner, use_mouse, theme, terminal)
         tui.detail = detail
         if notice:
             tui.note(notice, seconds=6.0)
