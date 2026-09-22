@@ -90,3 +90,15 @@ A design language for the terminal.
 - [x] `0040` The chrome spends five lines on two facts <sup>feature · p1</sup>
 - [x] `0041` The language is not enforced, so it will drift <sup>chore · p1</sup>
 
+## v2.1 — v2.1
+
+`##########` 100% · 3 of 3 done · due 2027-08-31
+
+Themes that inherit, and a config file.
+
+### done
+
+- [x] `0043` The default look does not inherit from the terminal it runs in <sup>bug · p0</sup>
+- [x] `0044` There is no way to change how andy looks <sup>feature · p1</sup>
+- [x] `0045` Every preference is a flag you must type every time <sup>feature · p1</sup>
+

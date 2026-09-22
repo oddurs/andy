@@ -69,9 +69,7 @@ class OneWayToReachAnAttribute(unittest.TestCase):
             if fn.name in PALETTE | ROLES:
                 continue
             for node in ast.walk(fn):
-                if (isinstance(node, ast.Attribute)
-                        and node.attr in ("_cyan", "_red", "_yellow", "_green",
-                                          "_dim")):
+                if isinstance(node, ast.Attribute) and node.attr == "_roles":
                     offenders.append(f"{cls}.{fn.name} line {node.lineno}: "
                                      f"{node.attr}")
         self.assertEqual(offenders, [], "the palette is reached through a role")
@@ -143,7 +141,7 @@ class ThePlainTextHalfAgrees(unittest.TestCase):
 
     def test_change_is_carried_by_the_sign_not_the_hue(self):
         body = self.function_source("print_delta")
-        for hue in ("ink.red", "ink.green", "ink.yellow"):
+        for hue in ("ink.safe(", "ink.rebuild(", "ink.review("):
             self.assertNotIn(hue, body, f"{hue} in print_delta means direction again")
 
     def test_a_change_is_coloured_by_what_removing_it_would_cost(self):
@@ -154,7 +152,7 @@ class ThePlainTextHalfAgrees(unittest.TestCase):
             self.assertNotIn("magnitude", self.function_source(name), name)
 
     def test_plenty_of_free_space_does_not_borrow_the_ratings_green(self):
-        self.assertNotIn("else ink.green", self.function_source("print_report"))
+        self.assertNotIn("else ink.safe", self.function_source("print_report"))
 
 
 class TwoFormsForALabelAndAValue(unittest.TestCase):

@@ -176,7 +176,7 @@ information: every rating is a character before it is a hue.
 
 Press `m` for a treemap: every category becomes a rectangle whose **area** is its
 share of the total. Click a rectangle to open it, right-click or `←` to come back
-up. The real thing fills each cell with a grey tone; here they are outlined.
+up. Cells are outlined in your terminal's own foreground, as below.
 
 ```
  all categories                                                        83.4G in 7
@@ -195,10 +195,10 @@ up. The real thing fills each cell with a grey tone; here they are outlined.
  └──────────────────────────────────┘ └───────────────────────────┘ └────┘ └───────┘
 ```
 
-Area carries the magnitude, so colour is left to do one job - separate
-neighbouring cells - which a single grey ramp does identically on a light or a
-dark terminal, since each cell supplies its own background. Every cell is
-labelled, so nothing depends on telling two shades apart.
+Area carries the magnitude, so the cells only need to be told apart, and an
+outline does that without andy choosing a colour. The `classic` theme shades
+them in xterm-256 greys instead, which was the look before 2.1. Every cell is
+labelled either way, so nothing depends on telling two shades apart.
 
 ### The mouse
 
@@ -224,6 +224,74 @@ the mouse alone entirely.
 | `y` | copy the path; `o` reveals it in Finder |
 | `m` | the area map; `↵` opens a cell, `←` backs out |
 | `d` | toggle the detail pane; `r` rescan; `?` keys; `q` quit |
+
+## Themes
+
+The default theme is called `terminal`, because that is what it defers to. It
+uses your terminal's own foreground and background and the sixteen ANSI colours
+your terminal theme defines, and nothing else. Whatever Ghostty, herdr, kitty or
+iTerm is set to, light or dark, andy is drawn in those colours. It never paints
+a background and never picks an absolute colour; a test checks both.
+
+```sh
+andy -i --theme mono       # no colour at all; every rating is still its character
+andy -i --theme classic    # the 1.x look, with the grey-shaded map
+```
+
+A theme is a table from the design language's roles to a style: a colour and
+any attributes, in any order. Colours are the ANSI names (`red`,
+`bright-red` and so on), `default` for your terminal's foreground, or `colorN`
+for an xterm-256 index. Write your own in the config file, starting from any
+other theme and changing only what you want to:
+
+```ini
+[theme mine]
+inherit     = terminal
+interactive = magenta
+review      = bright-red bold
+heading     = default bold underline
+map         = outline          # or shade
+```
+
+The roles are `heading`, `content`, `supporting`, `interactive`, `selected`,
+`safe`, `rebuild` and `review`. A theme restyles those and cannot add others,
+so no theme can colour a size by how big it is: there is no role for
+magnitude. `reverse` is kept for the cursor. The same theme styles the
+browser and the plain-text reports, so `andy --commands` never disagrees with
+`andy -i` about what a colour means.
+
+## Configuration
+
+Everything that is a flag can also go in `$XDG_CONFIG_HOME/andy/config`
+(usually `~/.config/andy/config`), in the plain `key = value` form Ghostty uses:
+
+```ini
+theme  = mine
+roots  = ~/src "~/client work"
+min    = 50M
+top    = 20
+mouse  = no
+engine = du            # or walk
+detail = yes           # open -i with the detail pane showing
+color  = yes           # colour works too
+```
+
+A flag beats the file, and the file beats the default. `andy --show-config`
+prints every setting, its value and where the value came from, formatted as a
+config file with the defaults commented out. So
+
+```sh
+andy --show-config > ~/.config/andy/config
+```
+
+gives you a file that changes nothing and documents everything; remove a `#`
+to change a setting. `--config PATH` reads a different file.
+
+A config file cannot stop andy starting. An unknown key, a value of the wrong
+kind, a theme that inherits from itself, or a file that doesn't parse is
+reported on stderr with its line number, and andy carries on with the default.
+It is read with the standard library's `configparser`, because andy supports
+Python 3.9 and `tomllib` only arrived in 3.11.
 
 ## What it looks at
 
