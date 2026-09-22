@@ -21,7 +21,10 @@ needs_curses = unittest.skipIf(andy.curses is None, "this Python has no curses")
 # roles that hand it out.
 PALETTE = {"styles"}
 ROLES = {"heading", "content", "supporting", "interactive", "selected",
-         "consequence"}
+         "consequence",
+         # the cursor's band lent to another role, so a mark on the cursor row
+         # keeps its own colour rather than turning into a solid block
+         "lift"}
 
 
 def source():
@@ -85,9 +88,11 @@ class OneWayToReachAnAttribute(unittest.TestCase):
         screen = type("S", (), {"getmaxyx": lambda self: (24, 80)})()
         tui = andy.Tui(screen, andy.Model(), None, use_mouse=False)
         tui.styles()
-        for role in sorted(ROLES - {"consequence"}):
+        for role in sorted(ROLES - {"consequence", "lift"}):
             self.assertIsInstance(getattr(tui, role)(), int, role)
         self.assertIsInstance(tui.consequence(andy.SAFE), int)
+        for role in andy.ROLE_NAMES:
+            self.assertIsInstance(tui.lift(role), int, f"lift({role})")
 
 
 class OneMeaningPerChannel(unittest.TestCase):

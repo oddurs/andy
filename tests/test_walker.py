@@ -167,10 +167,40 @@ class OneFilesystem(Tree):
 
 class Progress(Tree):
     def test_the_total_climbs_while_the_walk_runs(self):
+        """A walk that outlasts a tick publishes floors that only ever rise.
+
+        It used to rely on sixty small files taking longer than one 0.12s tick
+        to measure. Alone on a fast machine they do not, so it failed eight
+        times out of eight in a clean container and passed only when the rest
+        of the suite happened to slow the machine down. The property is about
+        long walks, so each engine is made to take a long one.
+        """
         for i in range(60):
             self.fill(f"d{i}/f.bin", 1)
+        real_popen, real_scan = subprocess.Popen, andy.scan_dir
+
+        class SlowDu:
+            """du, reading its lines back no faster than 100 a second."""
+            def __init__(self, *args, **kwargs):
+                self._proc = real_popen(*args, **kwargs)
+                self.stdout = self._lines()
+
+            def _lines(self):
+                for line in self._proc.stdout:
+                    time.sleep(0.01)
+                    yield line
+
+            def __getattr__(self, name):
+                return getattr(self._proc, name)
+
+        def slow_scan(*args, **kwargs):
+            time.sleep(0.01)
+            return real_scan(*args, **kwargs)
+
         for engine in ENGINES:
-            (size, status), running = measure(self.root, engine, workers=2)
+            with mock.patch.object(andy.subprocess, "Popen", SlowDu), \
+                 mock.patch.object(andy, "scan_dir", slow_scan):
+                (size, status), running = measure(self.root, engine, workers=2)
             self.assertEqual(status, "done", engine.__name__)
             self.assertTrue(running,
                             f"{engine.__name__} published no partial figures at all")

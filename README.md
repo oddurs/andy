@@ -253,6 +253,18 @@ heading     = default bold underline
 map         = outline          # or shade
 ```
 
+**The cursor sits on a band taken from your own palette.** When `andy -i` starts,
+it asks the terminal what colours it is drawing with — the standard OSC 10, 11
+and 4 queries, which Ghostty answers, and which herdr answers on Ghostty's
+behalf. It then puts the cursor row on the subtlest palette slot that is
+visibly different from your background and still leaves text readable
+(WCAG 4.5:1). In a dark theme that is usually ANSI 0 with the brightest white
+on it; in a light theme, ANSI 15 with your foreground. Every column on the row
+keeps its own colour on the band, so a safety mark stays the same red instead
+of becoming a solid block. A terminal that doesn't answer gets reverse video,
+which is what andy drew before; `selected = reverse` in a theme asks for it, and
+`selected = on color236 bold` picks a band yourself.
+
 The roles are `heading`, `content`, `supporting`, `interactive`, `selected`,
 `safe`, `rebuild` and `review`. A theme restyles those and cannot add others,
 so no theme can colour a size by how big it is: there is no role for
