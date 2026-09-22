@@ -421,7 +421,7 @@ class Bars(unittest.TestCase):
         tui.set_expanded(m.categories, True)
         tui.build_rows()
         node, _, whole = next(r for r in tui.rows if r[0].label == "only")
-        self.assertEqual(andy.bar(node.size / whole, 10), "\u2588" * 10)
+        self.assertEqual(andy.bar(node.size / whole, 10), andy.FULL_CELL * 10)
 
 
 @needs_curses
