@@ -78,6 +78,7 @@ def sample_model(project_count=6):
     caches = m.category(andy.PACKAGES)
     caches.children.append(Node(label="pnpm store", path="/h/pnpm",
                                 measured=3 * 2 ** 30, cmd="pnpm store prune",
+                                safety=andy.SAFE,
                                 note="Content-addressed store."))
     caches.children.append(Node(label="tiny", path="/h/tiny", measured=2 * MB))
     caches.children.append(Node(label="stuck", path="/h/stuck", measured=None,
@@ -358,6 +359,138 @@ class Zones(unittest.TestCase):
         self.assertTrue(node.expanded)
         tui.toggle(0)
         self.assertFalse(node.expanded)
+
+
+@needs_curses
+class Bars(unittest.TestCase):
+    """cairn 0034. The bar was drawn against the largest item at each level, so
+    a 637M row and a 7.5G row both drew full, four lines apart."""
+
+    def whole_for(self, tui, label):
+        return next(whole for n, _, whole in tui.rows if n.label == label)
+
+    def test_a_category_is_drawn_against_everything_mapped(self):
+        tui, _ = make_tui()
+        for node, depth, whole in tui.rows:
+            if depth == 0:
+                self.assertEqual(whole, tui.m.total)
+
+    def test_everything_below_is_drawn_against_its_category(self):
+        tui, _ = make_tui()
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        projects = tui.m.category(andy.PROJECTS)
+        for node, depth, whole in tui.rows:
+            if depth > 0 and any(node is n for n in tui.m.walk([projects])):
+                self.assertEqual(whole, projects.size, node.label)
+
+    def test_the_denominator_does_not_reset_with_depth(self):
+        """The bug: every level restarting made depth change the meaning."""
+        tui, _ = make_tui()
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        group = self.whole_for(tui, "node_modules")
+        member = self.whole_for(tui, "proj5/node_modules")
+        self.assertEqual(group, member)
+
+    def test_two_rows_of_the_same_size_draw_the_same_bar(self):
+        m = sample_model()
+        cat = m.category(andy.PACKAGES)
+        group = Node(label="group", kind="g")
+        group.children.append(Node(label="deep", path="/h/deep", measured=2 ** 30))
+        cat.children.append(group)
+        cat.children.append(Node(label="shallow", path="/h/shallow",
+                                 measured=2 ** 30))
+        m.recompute()
+        tui, _ = make_tui(model=m)
+        tui.set_expanded(m.categories, True)
+        tui.build_rows()
+        bars = {}
+        for node, _, whole in tui.rows:
+            if node.label in ("deep", "shallow"):
+                bars[node.label] = andy.bar(node.size / whole, 20)
+        self.assertEqual(bars["deep"], bars["shallow"],
+                         "the same size drew differently at different depths")
+
+    def test_a_full_bar_means_it_is_the_whole_category(self):
+        m = andy.Model()
+        cat = m.category(andy.PACKAGES)
+        cat.children.append(Node(label="only", path="/h/o", measured=2 ** 30))
+        m.recompute()
+        tui, _ = make_tui(model=m)
+        tui.set_expanded(m.categories, True)
+        tui.build_rows()
+        node, _, whole = next(r for r in tui.rows if r[0].label == "only")
+        self.assertEqual(andy.bar(node.size / whole, 10), "\u2588" * 10)
+
+
+@needs_curses
+class PathColumn(unittest.TestCase):
+    """cairn 0035. It printed `rsst/target   ~/Code/rsst/target`."""
+
+    def test_a_label_that_is_the_tail_leaves_only_the_prefix(self):
+        node = Node(label="rsst/target", path="/r/rsst/target", measured=1)
+        self.assertEqual(andy.Tui.path_text(node), "/r")
+
+    def test_a_catalog_location_still_shows_its_whole_path(self):
+        node = Node(label="pnpm store", path="/h/Library/pnpm/store", measured=1)
+        self.assertEqual(andy.Tui.path_text(node), "/h/Library/pnpm/store")
+
+    def test_a_breakdown_has_nothing_left_to_add(self):
+        node = Node(label="stable", path="/h/rustup/stable", detail=True, measured=1)
+        self.assertEqual(andy.Tui.path_text(node), "")
+
+    def test_a_row_with_no_path(self):
+        self.assertEqual(andy.Tui.path_text(Node(label="node_modules")), "")
+
+    def test_a_path_that_is_entirely_the_label(self):
+        node = Node(label="Code/target", path="/Code/target", measured=1)
+        self.assertEqual(andy.Tui.path_text(node), os.sep)
+
+    def test_the_column_is_only_as_wide_as_what_it_holds(self):
+        tui, screen = make_tui(width=140)
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        draw(tui)
+        rows = [screen.row(y) for y in range(screen.height)]
+        line = next(r for r in rows if "proj5/node_modules" in r)
+        self.assertIn("/r", line)
+        self.assertNotIn("/r/proj5/node_modules", line,
+                         "the path column restated the label")
+
+
+@needs_curses
+class SafetyColumn(unittest.TestCase):
+    """cairn 0036. The rating reached the summary in 1.4 and not the browser."""
+
+    def test_each_rating_has_its_own_character(self):
+        for rating, mark in andy.MARK.items():
+            node = Node(label="x", path="/x", measured=1, safety=rating)
+            self.assertEqual(andy.Tui.safety_text(node), mark)
+
+    def test_the_marks_match_the_report(self):
+        self.assertEqual(set(andy.MARK.values()), {"s", "r", "!"})
+
+    def test_a_row_that_is_not_a_place_shows_nothing(self):
+        self.assertEqual(andy.Tui.safety_text(Node(label="node_modules")), " ")
+
+    def test_it_reaches_the_screen(self):
+        tui, screen = make_tui()
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        draw(tui)
+        line = next(screen.row(y) for y in range(screen.height)
+                    if "pnpm store" in screen.row(y))
+        self.assertIn("s", line)
+
+    def test_it_is_a_character_and_not_only_a_colour(self):
+        """A colour-only signal says nothing on a monochrome terminal."""
+        tui, screen = make_tui()
+        tui.colour = False
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        draw(tui)
+        self.assertRegex(screen.text(), r"[sr!]")
 
 
 @needs_curses
