@@ -227,6 +227,27 @@ class Glyphs(unittest.TestCase):
                  and part.value.end_lineno != part.value.lineno]
         self.assertEqual(spans, [], f"f-string expressions spanning lines: {spans}")
 
+    def test_the_tests_do_not_hardcode_a_drawing_character_either(self):
+        """A test asserting on `\u2588` passes on a UTF-8 terminal and fails in a
+        C locale, where andy correctly draws `#`. That has now happened twice --
+        once in 1.2 and once writing 0034 -- and both times CI found it rather
+        than the suite. The glyph table is the only place these belong."""
+        import glob as _glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        # This file is the exception: it tests the table itself, so it is the
+        # one place that has to name the characters the table chooses between.
+        offenders = {}
+        for path in sorted(_glob.glob(os.path.join(here, "test_*.py"))):
+            if os.path.basename(path) == os.path.basename(__file__):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                stray = sorted({c for c in fh.read() if ord(c) > 0x2000})
+            if stray:
+                offenders[os.path.basename(path)] = stray
+        self.assertEqual(offenders, {},
+                         "compare against andy.FULL_CELL, andy.ELLIPSIS and the "
+                         "rest instead")
+
     def test_no_drawing_character_is_written_inline(self):
         """Every glyph goes through the table, so both sets stay in step."""
         with open(ANDY, encoding="utf-8") as fh:
