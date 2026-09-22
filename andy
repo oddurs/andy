@@ -19,6 +19,7 @@ import json
 import os
 import plistlib
 import queue
+import re
 import shlex
 import shutil
 import stat
@@ -79,7 +80,7 @@ def xdg_path(path: str) -> str:
 
 CACHE_DIR = os.path.join(XDG_CACHE, "andy")
 CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Only -i needs curses, and a Python built without ncurses is ordinary on the
 # minimal machines where somebody wants `andy --json` from a script. Importing
@@ -119,6 +120,7 @@ if UNICODE:
     PARTIAL_CELLS = "\u258f\u258e\u258d\u258c\u258b\u258a\u2589"
     DOT, RULE, ELLIPSIS, ATLEAST = "\u00b7", "\u2500", "\u2026", "\u2265"
     CLOSED, OPENED, SCROLLBAR = "\u25b8", "\u25be", "\u258c"
+    CORNERS, EDGE = "\u250c\u2510\u2514\u2518", "\u2502"
     ENTER = "\u21b5"
     DASH = "\u2014"
     CRUMB = "\u203a"
@@ -129,6 +131,7 @@ else:
     PARTIAL_CELLS = " " * 7          # ASCII has no eighth-cells to draw with
     DOT, RULE, ELLIPSIS, ATLEAST = "*", "-", "...", ">="
     CLOSED, OPENED, SCROLLBAR = ">", "v", "|"
+    CORNERS, EDGE = "++++", "|"
     ENTER = "enter"
     DASH = "--"
     CRUMB = ">"
@@ -2042,31 +2045,172 @@ def project_label(path: str, roots: list[str]) -> str:
 # plain-text output
 # --------------------------------------------------------------------------- #
 
-class Ink:
-    """Minimal ANSI styling that disappears when it should."""
+# --------------------------------------------------------------------------- #
+# themes
+# --------------------------------------------------------------------------- #
+#
+# A theme is a table from the design language's roles to a style, and nothing
+# more. It can restyle a role but not invent one -- so no theme can colour a
+# size by magnitude, because there is no magnitude role to colour.
+#
+# A style is a colour and any attributes, in any order: "bright-red bold",
+# "dim", "color108", "default underline". Colours are the sixteen ANSI names,
+# the terminal's own `default`, or colorN for an xterm-256 index.
 
-    def __init__(self, enabled: bool) -> None:
+ANSI = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+STYLE_ATTRS = ("bold", "dim", "underline", "reverse")
+ROLE_NAMES = ("heading", "content", "supporting", "interactive", "selected",
+              SAFE, REBUILD, REVIEW)
+MAP_STYLES = ("outline", "shade")
+
+THEMES: dict[str, dict[str, str]] = {
+    # Borrows the window it runs in. The terminal's own foreground and
+    # background, the sixteen ANSI colours its theme defines, and attributes it
+    # renders in its own palette -- nothing here is an absolute colour, so andy
+    # looks the part in Ghostty, herdr, kitty, iTerm or a plain xterm, light or
+    # dark, whatever the user has chosen. The map is outlined rather than
+    # shaded, because a shade would have to be a colour andy picked.
+    "terminal": {"heading": "bold", "content": "", "supporting": "dim",
+                 "interactive": "cyan", "selected": "reverse",
+                 SAFE: "green", REBUILD: "yellow", REVIEW: "red",
+                 "map": "outline"},
+    # No colour at all: what NO_COLOR gives you, chosen on purpose. Every
+    # rating is still its character; "look first" keeps its weight.
+    "mono": {"heading": "bold", "content": "", "supporting": "dim",
+             "interactive": "bold", "selected": "reverse",
+             SAFE: "", REBUILD: "", REVIEW: "bold", "map": "outline"},
+    # The 1.x look: the same roles, and a map shaded in xterm-256 greys where
+    # the terminal has them. Does not inherit, which is why it is not the
+    # default.
+    "classic": {"heading": "bold", "content": "", "supporting": "dim",
+                "interactive": "cyan", "selected": "reverse",
+                SAFE: "green", REBUILD: "yellow", REVIEW: "red",
+                "map": "shade"},
+}
+DEFAULT_THEME = "terminal"
+
+
+def parse_style(spec: str) -> tuple[int | None, frozenset, list[str]]:
+    """"bright-red bold" -> (colour index or None for the default, attributes,
+    anything that could not be understood)."""
+    colour: int | None = None
+    attrs: set[str] = set()
+    problems: list[str] = []
+    for word in (spec or "").lower().replace(",", " ").split():
+        if word in STYLE_ATTRS:
+            attrs.add(word)
+        elif word in ("normal", "plain", "none", "default"):
+            if word == "default":
+                colour = None
+        elif word in ANSI:
+            colour = ANSI.index(word)
+        elif word.startswith("bright-") and word[7:] in ANSI:
+            colour = ANSI.index(word[7:]) + 8
+        elif word.startswith("color") and word[5:].isdigit() and int(word[5:]) < 256:
+            colour = int(word[5:])
+        else:
+            problems.append(f"{word!r} is not a colour or an attribute")
+    return colour, frozenset(attrs), problems
+
+
+def resolve_theme(name: str, custom: dict | None = None) -> tuple[dict[str, str], list[str]]:
+    """The whole role table for a theme, following `inherit`, and anything
+    wrong with it. Never raises: a theme is something a person wrote."""
+    custom = custom or {}
+    problems: list[str] = []
+    layers: list[dict[str, str]] = []
+    seen: set[str] = set()
+    current = name
+    while True:
+        if current in seen:
+            problems.append(f"theme {name!r} inherits from itself through {current!r}")
+            break
+        seen.add(current)
+        if current in custom:
+            layer = dict(custom[current])
+            parent = layer.pop("inherit", DEFAULT_THEME) or DEFAULT_THEME
+            layers.append(layer)
+            current = parent
+            continue
+        if current in THEMES:
+            layers.append(THEMES[current])
+            break
+        problems.append(f"there is no theme called {current!r}; "
+                        f"using {DEFAULT_THEME!r}")
+        layers.append(THEMES[DEFAULT_THEME])
+        break
+
+    table: dict[str, str] = dict(THEMES[DEFAULT_THEME])
+    for layer in reversed(layers):
+        table.update(layer)
+
+    for key in list(table):
+        if key == "map":
+            if table[key] not in MAP_STYLES:
+                problems.append(f"theme {name!r}: map = {table[key]!r} should be "
+                                f"one of {', '.join(MAP_STYLES)}")
+                table[key] = "outline"
+            continue
+        if key not in ROLE_NAMES:
+            problems.append(f"theme {name!r}: {key!r} is not a role. A theme "
+                            f"restyles {', '.join(ROLE_NAMES)}, and nothing else")
+            del table[key]
+            continue
+        _, attrs, bad = parse_style(table[key])
+        problems.extend(f"theme {name!r}, {key}: {p}" for p in bad)
+        if "reverse" in attrs and key != "selected":
+            # the design language: reverse is the cursor and only the cursor
+            problems.append(f"theme {name!r}, {key}: reverse is reserved for the "
+                            f"cursor, so it was dropped")
+            table[key] = " ".join(w for w in table[key].split()
+                                  if w.lower() != "reverse")
+    return table, problems
+
+
+def sgr(spec: str) -> str:
+    """A style as an ANSI SGR parameter string, for the plain-text reports."""
+    colour, attrs, _ = parse_style(spec)
+    codes = [{"bold": "1", "dim": "2", "underline": "4", "reverse": "7"}[a]
+             for a in sorted(attrs)]
+    if colour is not None:
+        if colour < 8:
+            codes.append(str(30 + colour))
+        elif colour < 16:
+            codes.append(str(90 + colour - 8))
+        else:
+            codes.append(f"38;5;{colour}")
+    return ";".join(codes)
+
+
+class Ink:
+    """ANSI styling for the plain-text reports, from the same theme as the
+    browser -- one theme drives both halves, so `andy --commands` can never
+    disagree with `andy -i` about what a colour means."""
+
+    def __init__(self, enabled: bool, theme: dict[str, str] | None = None) -> None:
         self.on = enabled
+        table = theme or resolve_theme(DEFAULT_THEME)[0]
+        self._codes = {role: sgr(table.get(role, "")) for role in ROLE_NAMES}
 
     def _w(self, code: str, text: str) -> str:
-        return f"\033[{code}m{text}\033[0m" if self.on else text
+        return f"\033[{code}m{text}\033[0m" if self.on and code else text
 
-    def dim(self, t): return self._w("2", t)
-    def bold(self, t): return self._w("1", t)
-    def head(self, t): return self._w("1;4", t)
-    def accent(self, t): return self._w("36", t)
-    def green(self, t): return self._w("32", t)
-    def yellow(self, t): return self._w("33", t)
-    def red(self, t): return self._w("31", t)
+    def dim(self, t): return self._w(self._codes["supporting"], t)
+    def bold(self, t): return self._w(self._codes["heading"], t)
+    def head(self, t): return self._w(";".join(c for c in (self._codes["heading"], "4") if c), t)
+    def accent(self, t): return self._w(self._codes["interactive"], t)
+    def safe(self, t): return self._w(self._codes[SAFE], t)
+    def rebuild(self, t): return self._w(self._codes[REBUILD], t)
+    def review(self, t): return self._w(self._codes[REVIEW], t)
 
     def safety_colour(self, rating: str, text: str) -> str:
-        """Any text, in the colour of a rating. The plain-text half of the
+        """Any text, in the style of a rating. The plain-text half of the
         TUI's consequence role, so the two halves of the program agree."""
-        return {SAFE: self.green, REBUILD: self.yellow,
-                REVIEW: self.red}.get(rating, self.dim)(text)
+        return {SAFE: self.safe, REBUILD: self.rebuild,
+                REVIEW: self.review}.get(rating, self.dim)(text)
 
     def safety(self, s: str) -> str:
-        return {SAFE: self.green, REBUILD: self.yellow, REVIEW: self.red}.get(s, self.dim)(s)
+        return self.safety_colour(s, s)
 
 
 def term_width(default: int = 92) -> int:
@@ -2085,7 +2229,7 @@ def explain_nothing(m: Model, ink: Ink, p) -> None:
     one it was is most of the value here.
     """
     if m.phase.startswith("scan error"):
-        p(f"  {ink.red('the scan did not finish')}  {ink.dim(m.phase)}")
+        p(f"  {ink.review('the scan did not finish')}  {ink.dim(m.phase)}")
         p(f"  {ink.dim('so this is not a report that nothing is there')}")
         return
 
@@ -2120,7 +2264,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     # Red when the disk is nearly full, because that is the problem. Plain
     # otherwise: plenty of free space is not a safety rating and should not
     # borrow the rating's green.
-    tight = ink.red if free < 15 * 2 ** 30 else (lambda text: text)
+    tight = ink.review if free < 15 * 2 ** 30 else (lambda text: text)
     p(f" {ink.bold('andy')}  "
       f"{ink.dim(f'{human(total)} volume {DOT} {human(used)} used {DOT} ')}"
       f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
@@ -2147,9 +2291,9 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     if m.total:
         p()
         p(f"  {ink.dim('of which')}  "
-          f"{ink.green(human(split[SAFE]))} {ink.dim('regenerates itself')}   "
-          f"{ink.yellow(human(split[REBUILD]))} {ink.dim('costs you a rebuild')}   "
-          f"{ink.red(human(split[REVIEW]))} {ink.dim('wants a look first')}")
+          f"{ink.safe(human(split[SAFE]))} {ink.dim('regenerates itself')}   "
+          f"{ink.rebuild(human(split[REBUILD]))} {ink.dim('costs you a rebuild')}   "
+          f"{ink.review(human(split[REVIEW]))} {ink.dim('wants a look first')}")
 
     if top:
         items = sorted((n for n in m.walk() if m.is_location(n)),
@@ -2166,9 +2310,9 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
               f"{short_path(n.label, namew).ljust(namew)}  "
               f"{ink.dim(short_path(n.path, room))}")
         p()
-        legend = (f"{ink.green('s')} regenerates itself   "
-                  f"{ink.yellow('r')} costs a rebuild   "
-                  f"{ink.red('!')} wants a look first")
+        legend = (f"{ink.safe('s')} regenerates itself   "
+                  f"{ink.rebuild('r')} costs a rebuild   "
+                  f"{ink.review('!')} wants a look first")
         p(f"  {ink.dim(legend)}")
 
     blocked = [n for n in m.walk() if n.blocked]
@@ -2495,6 +2639,237 @@ def to_json(m: Model) -> dict:
 # entry point
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# configuration
+# --------------------------------------------------------------------------- #
+#
+# $XDG_CONFIG_HOME/andy/config, in the plain `key = value` form Ghostty uses,
+# with `#` comments and custom themes in `[theme NAME]` sections below. Read
+# with configparser rather than TOML because andy supports Python 3.9 and
+# tomllib arrived in 3.11 -- a zero-dependency program cannot take a TOML
+# parser as a dependency, and a hand-written one would be a second program.
+#
+# A flag beats the file and the file beats the default. A config is something a
+# person wrote, so nothing in it can stop andy starting: whatever is wrong is
+# named on stderr and the default is used instead.
+
+CONFIG_FILE = os.path.join(XDG_CONFIG, "andy", "config")
+
+# name: (default, kind, what it does)
+SETTINGS: dict[str, tuple] = {
+    "theme": ("terminal", "theme", "how andy looks: terminal, mono, classic or one of yours"),
+    "roots": ([], "paths", "directories to look for project build output in"),
+    "min": ("10M", "size", "hide anything smaller in --tree and --commands"),
+    "top": (12, "int", "how many largest items the summary lists"),
+    "mouse": (True, "bool", "mouse reporting in -i"),
+    "detail": (True, "bool", "open -i with the detail pane showing"),
+    "projects": (True, "bool", "look in project directories at all"),
+    "engine": ("du", "engine", "du, or walk to measure without spawning du"),
+    "color": (True, "bool", "colour in the plain-text reports"),
+}
+# Both spellings. The program says colour everywhere, and a setting rejected
+# for how its name is spelled is a setting the user thinks they set.
+ALIASES = {"colour": "color"}
+TRUE_WORDS = ("yes", "true", "on", "1")
+FALSE_WORDS = ("no", "false", "off", "0")
+
+
+@dataclass
+class Settings:
+    values: dict
+    sources: dict                 # name -> "default" | "config" | "flag"
+    themes: dict                  # custom theme sections, by name
+    path: str
+    found: bool
+    problems: list
+    state: str = ""
+
+    def __getitem__(self, name):
+        return self.values[name]
+
+
+def convert_setting(name: str, raw: str):
+    """A config value as the type its setting wants. Raises ValueError with a
+    sentence a person can act on."""
+    default, kind, _ = SETTINGS[name]
+    text = raw.strip()
+    if kind == "bool":
+        if text.lower() in TRUE_WORDS:
+            return True
+        if text.lower() in FALSE_WORDS:
+            return False
+        raise ValueError(f"{name} = {raw!r} should be yes or no")
+    if kind == "int":
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(f"{name} = {raw!r} should be a whole number") from None
+        if value < 0:
+            raise ValueError(f"{name} = {raw!r} cannot be negative")
+        return value
+    if kind == "size":
+        if not re.fullmatch(r"\d+(\.\d+)?\s*[kmgt]?b?", text, re.IGNORECASE):
+            raise ValueError(f"{name} = {raw!r} should be a size like 50M or 1G")
+        return text
+    if kind == "paths":
+        try:
+            return [os.path.expanduser(p) for p in shlex.split(text)]
+        except ValueError as exc:
+            raise ValueError(f"{name}: {exc}") from None
+    if kind == "engine":
+        if text.lower() not in ("du", "walk"):
+            raise ValueError(f"{name} = {raw!r} should be du or walk")
+        return text.lower()
+    return text
+
+
+def load_config(path: str | None = None) -> Settings:
+    """Read the config file, if there is one. Never raises."""
+    explicit = path is not None
+    path = os.path.expanduser(path) if path else CONFIG_FILE
+    values = {name: spec[0] for name, spec in SETTINGS.items()}
+    sources = {name: "default" for name in SETTINGS}
+    themes: dict = {}
+    problems: list[str] = []
+    settings = Settings(values, sources, themes, path, False, problems)
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        if explicit:
+            problems.append(f"{tilde(path)}: no such file")
+        return settings
+    except OSError as exc:
+        problems.append(f"{tilde(path)}: {exc.strerror or exc}")
+        return settings
+    settings.found = True
+    lines = text.splitlines()
+
+    def where(key: str, section: str | None = None) -> str:
+        """`line N` for a key, so a warning points at something."""
+        inside = section is None
+        for number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if stripped.startswith("["):
+                inside = section is not None and stripped.strip("[] ").lower() == section
+                continue
+            if inside and re.match(rf"{re.escape(key)}\s*[=:]", stripped, re.IGNORECASE):
+                return f"line {number}"
+        return "the file"
+
+    import configparser
+    parser = configparser.ConfigParser(interpolation=None, strict=False,
+                                       inline_comment_prefixes=("#",),
+                                       comment_prefixes=("#", ";"))
+    try:
+        # the top of the file is settings without a section header, as in
+        # Ghostty's config; an explicit [andy] is accepted too
+        parser.read_string("[andy]\n" + text)
+    except configparser.Error as exc:
+        # name the line: configparser counts the [andy] header we prepended
+        errors = getattr(exc, "errors", None) or []
+        if errors:
+            number, line = errors[0]
+            detail = f"line {number - 1} does not parse: {line.strip()!r}"
+        else:
+            detail = str(exc).splitlines()[0]
+            detail = re.sub(r"line (\d+)", lambda m: f"line {int(m.group(1)) - 1}",
+                            detail)
+        problems.append(f"{tilde(path)}: {detail}; ignoring the whole file")
+        settings.state = "could not be read, so these are defaults"
+        return settings
+
+    for section in parser.sections():
+        name = section.strip()
+        if name.lower() == "andy":
+            for key, raw in parser.items(section):
+                key = ALIASES.get(key, key)
+                if key not in SETTINGS:
+                    close = ", ".join(sorted(SETTINGS))
+                    problems.append(f"{tilde(path)} {where(key)}: {key!r} is not a "
+                                    f"setting (there is {close})")
+                    continue
+                try:
+                    values[key] = convert_setting(key, raw)
+                    sources[key] = "config"
+                except ValueError as exc:
+                    problems.append(f"{tilde(path)} {where(key)}: {exc}; "
+                                    f"using {SETTINGS[key][0]!r}")
+        elif name.lower().startswith("theme "):
+            theme = name[6:].strip()
+            if theme in THEMES:
+                problems.append(f"{tilde(path)}: [theme {theme}] would replace a "
+                                f"built-in theme; name it something else")
+                continue
+            themes[theme] = dict(parser.items(section))
+            # checked whether or not it is the one in use: you wrote it, so
+            # what is wrong with it is worth hearing now rather than on the day
+            # you switch to it
+            problems.extend(resolve_theme(theme, {theme: themes[theme]})[1])
+        else:
+            problems.append(f"{tilde(path)}: [{name}] is not a section andy "
+                            f"reads; custom themes go in [theme NAME]")
+    return settings
+
+
+def apply_flags(settings: Settings, args: argparse.Namespace) -> Settings:
+    """Flags beat the file. A flag the user did not pass changes nothing."""
+    passed = {
+        "theme": args.theme,
+        "roots": [os.path.expanduser(r) for r in args.roots] or None,
+        "min": args.min,
+        "top": args.top,
+        "mouse": False if args.no_mouse else None,
+        "projects": False if args.no_projects else None,
+        "engine": "walk" if args.use_walker else None,
+        "color": False if args.no_color else None,
+    }
+    for name, value in passed.items():
+        if value is not None:
+            settings.values[name] = value
+            settings.sources[name] = "flag"
+    return settings
+
+
+def print_settings(settings: Settings, roots: list[str], out=sys.stdout) -> None:
+    """Every setting, what it is and where it came from -- as a config file.
+
+    Defaults are commented out, so `andy --show-config > ~/.config/andy/config`
+    writes a file that changes nothing and documents everything, and deleting
+    a `#` is how you change one.
+    """
+    p = lambda s="": print(s, file=out)
+    state = settings.state or ("found" if settings.found
+                               else "not found, so these are defaults")
+    p(f"# andy {VERSION} {DOT} {tilde(settings.path)} ({state})")
+    p()
+    width = max(len(name) for name in SETTINGS)
+    for name, (default, kind, help_text) in SETTINGS.items():
+        value = settings.values[name]
+        if name == "roots":
+            # quoted only when a path needs it, and in double quotes so that ~
+            # still reads as home rather than as a literal directory
+            shown = " ".join(f'"{tilde(r)}"' if re.search(r'[\s"\'\\]', tilde(r))
+                             else tilde(r) for r in (value or roots))
+        elif isinstance(value, bool):
+            shown = "yes" if value else "no"
+        else:
+            shown = str(value)
+        source = settings.sources[name]
+        lead = "" if source != "default" else "# "
+        note = help_text if source == "default" else f"{help_text} ({source})"
+        p(f"{lead}{name.ljust(width)} = {shown}".ljust(width + 30) + f"  # {note}")
+    names = list(THEMES) + [t for t in settings.themes if t not in THEMES]
+    p()
+    p(f"# themes: {', '.join(names)}")
+    for theme, table in settings.themes.items():
+        p()
+        p(f"[theme {theme}]")
+        for key, value in table.items():
+            p(f"{key} = {value}")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog="andy",
@@ -2512,9 +2887,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("-j", "--json", action="store_true", help="print JSON")
     ap.add_argument("-d", "--delta", action="store_true",
                     help="what changed since the previous scan")
-    ap.add_argument("-n", "--top", type=int, default=12, metavar="N",
+    ap.add_argument("-n", "--top", type=int, default=None, metavar="N",
                     help="how many largest items to list (default 12, 0 to omit)")
-    ap.add_argument("-m", "--min", default="10M", metavar="SIZE",
+    ap.add_argument("-m", "--min", default=None, metavar="SIZE",
                     help="hide anything smaller, e.g. 50M or 1G (default 10M)")
     ap.add_argument("--no-projects", action="store_true",
                     help="skip the per-project artifact scan (much faster)")
@@ -2526,6 +2901,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--no-mouse", action="store_true",
                     help="disable mouse reporting in -i, so the terminal keeps "
                          "its own click-and-drag text selection")
+    ap.add_argument("--theme", metavar="NAME",
+                    help="terminal (the default, which follows your terminal's "
+                         "own colours), mono, classic, or one from your config")
+    ap.add_argument("--config", metavar="PATH",
+                    help=f"read settings from PATH instead of {tilde(CONFIG_FILE)}")
+    ap.add_argument("--show-config", action="store_true",
+                    help="print every setting and where it came from, as a "
+                         "config file you can start from")
     ap.add_argument("-V", "--version", action="version", version=f"andy {VERSION}")
     return ap.parse_args(argv)
 
@@ -2544,9 +2927,16 @@ def parse_size(text: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    settings = apply_flags(load_config(args.config), args)
+    theme, theme_problems = resolve_theme(settings["theme"], settings.themes)
+    problems = settings.problems + theme_problems
+    for problem in problems:
+        print(f"andy: config: {problem}", file=sys.stderr)
 
-    roots = (dedupe_dirs([os.path.expanduser(r) for r in args.roots])
-             or default_roots())
+    roots = dedupe_dirs(settings["roots"]) or default_roots()
+    if args.show_config:
+        print_settings(settings, roots)
+        return 0
     if args.delta and args.fresh:
         print("andy: --delta compares against the cached scan, which --fresh "
               "ignores", file=sys.stderr)
@@ -2555,9 +2945,9 @@ def main(argv: list[str] | None = None) -> int:
     model = Model()
     model.roots = roots
     scanner = Scanner(model, roots,
-                      include_projects=not args.no_projects,
+                      include_projects=settings["projects"],
                       use_cache=not args.fresh,
-                      use_walker=args.use_walker)
+                      use_walker=settings["engine"] == "walk")
 
     if args.tui:
         if curses is None:
@@ -2569,11 +2959,18 @@ def main(argv: list[str] | None = None) -> int:
             print("andy: -i needs a terminal", file=sys.stderr)
             return 2
         scanner.start()
-        run_tui(model, scanner, use_mouse=not args.no_mouse)
+        run_tui(model, scanner, use_mouse=settings["mouse"], theme=theme,
+                detail=settings["detail"],
+                notice=(f"config: {len(problems)} problem"
+                        f"{'s' if len(problems) != 1 else ''}, listed on exit"
+                        if problems else ""))
+        for problem in problems:        # the alternate screen hid them
+            print(f"andy: config: {problem}", file=sys.stderr)
         return 0
 
-    colour = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
-    ink = Ink(colour)
+    colour = (sys.stdout.isatty() and settings["color"]
+              and not os.environ.get("NO_COLOR"))
+    ink = Ink(colour, theme)
     quiet = args.json or args.commands
 
     scanner.start()
@@ -2590,7 +2987,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\r\033[2K", end="", file=sys.stderr, flush=True)
     scanner.join(1)
 
-    min_bytes = parse_size(args.min)
+    min_bytes = parse_size(settings["min"])
+    top = max(0, settings["top"])
     with model.lock:
         if args.json:
             json.dump(to_json(model), sys.stdout, indent=2)
@@ -2598,11 +2996,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.commands:
             print_commands(model, ink, min_bytes)
         elif args.delta:
-            print_delta(model, ink, max(0, args.top))
+            print_delta(model, ink, top)
         elif args.tree:
             print_tree(model, ink, min_bytes)
         else:
-            print_report(model, ink, max(0, args.top))
+            print_report(model, ink, top)
     return 0
 
 
@@ -2769,8 +3167,9 @@ class Tui:
     MIN_SMALL = 10 * 2 ** 20     # hidden unless 'a'
 
     def __init__(self, stdscr, model: Model, scanner: Scanner,
-                 use_mouse: bool = True) -> None:
+                 use_mouse: bool = True, theme: dict[str, str] | None = None) -> None:
         self.s = stdscr
+        self.theme = theme or resolve_theme(DEFAULT_THEME)[0]
         self.m = model
         self.scanner = scanner
         self.cursor = 0
@@ -2847,28 +3246,27 @@ class Tui:
 
     def heading(self) -> int:
         """A category, a pane title, the name of the thing in focus."""
-        return curses.A_BOLD
+        return self._roles["heading"]
 
     def content(self) -> int:
         """An ordinary row."""
-        return curses.A_NORMAL
+        return self._roles["content"]
 
     def supporting(self) -> int:
         """Present but secondary: field keys, paths, units, counts, rules."""
-        return self._dim
+        return self._roles["supporting"]
 
     def interactive(self) -> int:
         """Something that responds to a key or the mouse."""
-        return self._cyan
+        return self._roles["interactive"]
 
     def selected(self) -> int:
         """The cursor, and nothing else."""
-        return curses.A_REVERSE
+        return self._roles["selected"]
 
     def consequence(self, safety: str) -> int:
         """What removing it would cost. The only use of the warm scale."""
-        return {SAFE: self._green, REBUILD: self._yellow,
-                REVIEW: self._red}.get(safety, self._dim)
+        return self._roles.get(safety, self._roles["supporting"])
 
     def field(self, y: int, x: int, key: str, value: str, attr: int = 0) -> None:
         """A fact: `mapped   79.9G`."""
@@ -2901,28 +3299,46 @@ class Tui:
         self.CLICK = curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED
         self.RIGHT_CLICK = curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED
         self.colour = False
+        self.map_pairs = []
         try:
             curses.start_color()
+            # -1 is the terminal's own colour. Every pair below uses it for the
+            # background, so andy never paints a surface the user did not pick.
             curses.use_default_colors()
-            for i, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_RED,
-                                    curses.COLOR_YELLOW, curses.COLOR_GREEN), start=1):
-                curses.init_pair(i, fg, -1)
-            self.map_pairs = []
-            if curses.COLORS >= 256:
-                for k, (bg, fg) in enumerate(MAP_RAMP):
-                    curses.init_pair(10 + k, fg, bg)
-                    self.map_pairs.append(curses.color_pair(10 + k))
             self.colour = True
         except Exception:
             self.colour = False
-            self.map_pairs = []
-        # The palette. Private on purpose: every drawing call asks for a role,
-        # so a hue can only ever mean the one thing its role means.
-        self._cyan = curses.color_pair(1) if self.colour else curses.A_BOLD
-        self._red = curses.color_pair(2) if self.colour else curses.A_NORMAL
-        self._yellow = curses.color_pair(3) if self.colour else curses.A_NORMAL
-        self._green = curses.color_pair(4) if self.colour else curses.A_NORMAL
-        self._dim = curses.A_DIM
+        colours = getattr(curses, "COLORS", 0) if self.colour else 0
+
+        # The palette, built from the theme. Private on purpose: every drawing
+        # call asks for a role, so a style can only mean what its role means.
+        bits = {"bold": curses.A_BOLD, "dim": curses.A_DIM,
+                "underline": curses.A_UNDERLINE, "reverse": curses.A_REVERSE}
+        mono = resolve_theme("mono")[0]
+        self._roles = {}
+        for pair, role in enumerate(ROLE_NAMES, start=1):
+            colour, attrs, _ = parse_style(self.theme.get(role, ""))
+            attr = curses.A_NORMAL
+            for name in attrs:
+                attr |= bits[name]
+            if colour is not None and colour < colours:
+                try:
+                    curses.init_pair(pair, colour, -1)
+                    attr |= curses.color_pair(pair)
+                except curses.error:
+                    pass
+            elif colour is not None and not attrs:
+                # A colour this terminal cannot show, on a role with no other
+                # emphasis: fall back to what the monochrome theme does there,
+                # so a key or a "look first" does not vanish into plain text.
+                for name in parse_style(mono.get(role, ""))[1]:
+                    attr |= bits[name]
+            self._roles[role] = attr
+
+        if self.theme.get("map") == "shade" and colours >= 256:
+            for k, (bg, fg) in enumerate(MAP_RAMP):
+                curses.init_pair(20 + k, fg, bg)
+                self.map_pairs.append(curses.color_pair(20 + k))
 
     def put(self, y: int, x: int, text: str, attr: int = 0) -> None:
         h, w = self.s.getmaxyx()
@@ -3247,22 +3663,59 @@ class Tui:
             # one there is no fill: the cells are drawn as outlines instead, so
             # that reverse video can go on meaning the selection and nothing
             # else.
-            fill = self.map_pairs[step] if self.map_pairs else self.content()
-            if i == self.map_sel:
-                fill |= self.selected()
             dw, dh = max(1, cw - 1), max(1, ch - 1)
             for r in range(dh):
-                if self.map_pairs or i == self.map_sel:
-                    self.put(cy + r, cx, " " * dw, fill)
-                elif r in (0, dh - 1):
-                    self.put(cy + r, cx, RULE * dw, self.supporting())
                 self.zone(cy + r, cx, cx + dw - 1, "cell", i)
-            if dw >= 4:
-                self.put(cy, cx, clip_end(node.label, dw), fill | self.heading())
-            if dh >= 2 and dw >= 5:
-                self.put(cy + 1, cx, clip_end(human(node.size), dw), fill)
-            if dh >= 4 and dw >= 12 and total:
-                self.put(cy + 2, cx, f"{node.size / total * 100:.0f}%", fill)
+            share = f"{node.size / total * 100:.0f}%" if total else ""
+            if self.map_pairs or i == self.map_sel:
+                self.draw_filled_cell(node, share, cx, cy, dw, dh,
+                                      self.map_pairs[step] if self.map_pairs
+                                      else self.content(), i == self.map_sel)
+            else:
+                self.draw_outlined_cell(node, share, cx, cy, dw, dh)
+
+    def draw_filled_cell(self, node: Node, share: str, x: int, y: int,
+                         dw: int, dh: int, fill: int, selected: bool) -> None:
+        """A shaded cell, or the selected one. The shade is only used by a
+        theme that asked for it; reverse is only ever the selection."""
+        if selected:
+            fill |= self.selected()
+        for r in range(dh):
+            self.put(y + r, x, " " * dw, fill)
+        if dw >= 4:
+            self.put(y, x + 1, clip_end(node.label, dw - 2), fill | self.heading())
+        if dh >= 2 and dw >= 5:
+            self.put(y + 1, x + 1, clip_end(human(node.size), dw - 2), fill)
+        if dh >= 3 and dw >= 12 and share:
+            self.put(y + 1, x + dw - len(share) - 1, share, fill)
+
+    def draw_outlined_cell(self, node: Node, share: str, x: int, y: int,
+                           dw: int, dh: int) -> None:
+        """A cell drawn in the terminal's own foreground, with no fill.
+
+        This is how the default theme separates cells: a shade would have to be
+        a colour andy chose, and the default borrows every colour it uses from
+        the window it is in. The label sits in the top edge, so the outline
+        costs no extra row.
+        """
+        tl, tr, bl, br = CORNERS
+        edge = self.supporting()
+        if dw < 4 or dh < 2:
+            # too small for a box: the label alone still says what it is
+            self.put(y, x, clip_end(node.label, dw), self.heading())
+            return
+        title = clip_end(node.label, max(1, dw - 5))
+        top = f"{tl}{RULE} {title} "
+        self.put(y, x, top + RULE * max(0, dw - len(top) - 1) + tr, edge)
+        self.put(y, x + 3, title, self.heading())
+        for r in range(1, dh - 1):
+            self.put(y + r, x, EDGE, edge)
+            self.put(y + r, x + dw - 1, EDGE, edge)
+        self.put(y + dh - 1, x, bl + RULE * max(0, dw - 2) + br, edge)
+        if dh >= 3 and dw >= 6:
+            self.put(y + 1, x + 2, clip_end(human(node.size), dw - 4), self.content())
+        if dh >= 3 and dw >= 14 and share:
+            self.put(y + 1, x + dw - len(share) - 2, share, self.supporting())
 
     def draw_scrollbar(self, y0: int, body: int, w: int) -> None:
         total = len(self.rows)
@@ -3855,9 +4308,15 @@ class Tui:
                 return
 
 
-def run_tui(model: Model, scanner: Scanner, use_mouse: bool = True) -> None:
+def run_tui(model: Model, scanner: Scanner, use_mouse: bool = True,
+            theme: dict[str, str] | None = None, detail: bool = True,
+            notice: str = "") -> None:
     def inner(stdscr):
-        Tui(stdscr, model, scanner, use_mouse).loop()
+        tui = Tui(stdscr, model, scanner, use_mouse, theme)
+        tui.detail = detail
+        if notice:
+            tui.note(notice, seconds=6.0)
+        tui.loop()
 
     try:
         curses.wrapper(inner)

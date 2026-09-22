@@ -117,13 +117,13 @@ class Tilde(unittest.TestCase):
 class Ink(unittest.TestCase):
     def test_disabled_ink_is_the_identity(self):
         ink = andy.Ink(False)
-        self.assertEqual(ink.red("x"), "x")
+        self.assertEqual(ink.review("x"), "x")
         self.assertEqual(ink.safety(andy.SAFE), andy.SAFE)
 
     def test_enabled_ink_wraps_and_resets(self):
         ink = andy.Ink(True)
-        self.assertTrue(ink.red("x").startswith("\033["))
-        self.assertTrue(ink.red("x").endswith("\033[0m"))
+        self.assertTrue(ink.review("x").startswith("\033["))
+        self.assertTrue(ink.review("x").endswith("\033[0m"))
 
 
 if __name__ == "__main__":
