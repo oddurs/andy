@@ -2879,13 +2879,43 @@ class Tui:
         return self.DIM
 
     @staticmethod
-    def show_path(node: Node, pathw: int) -> bool:
-        """Whether the path column would say anything the label does not.
+    def path_text(node: Node) -> str:
+        """The part of the path the label has not already said.
+
+        A project artifact is labelled by its path relative to the scan root,
+        so printing the whole path beside it spends a column restating the
+        row -- `rsst/target   ~/Code/rsst/target` -- while the label next to it
+        is being trimmed to fit. What the label leaves out is the root, and
+        that is worth a column when several are configured.
 
         An itemised child is named by its own basename and sits directly under
-        the row holding its directory, so printing its path repeats the line
-        above and the label beside it at once."""
-        return bool(pathw and node.path and not node.detail)
+        the row holding its directory, so it has nothing left to add at all.
+        """
+        if not node.path or node.detail:
+            return ""
+        shown = tilde(node.path)
+        tail = os.sep + node.label
+        if node.label and shown.endswith(tail):
+            return shown[:-len(tail)] or os.sep
+        return shown
+
+    @staticmethod
+    def safety_text(node: Node) -> str:
+        """The rating as a character, the same one the report prints.
+
+        A character rather than only a colour: safe and review share a first
+        letter, which is why the marks are s, r and !, and a colour-only signal
+        says nothing on a monochrome terminal or to a reader who cannot tell
+        these three apart. A row with no rating shows nothing rather than a
+        guess.
+        """
+        if not node.cmd and not node.path:
+            return " "
+        return MARK.get(node.safety, " ")
+
+    def safety_attr(self, node: Node) -> int:
+        return {SAFE: self.GREEN, REBUILD: self.YELLOW,
+                REVIEW: self.RED}.get(node.safety, self.DIM)
 
     @staticmethod
     def size_text(node: Node) -> str:
@@ -2935,21 +2965,27 @@ class Tui:
                 return sorted(kids, key=lambda n: n.label.lower())
             return kids
 
-        def emit(node: Node, depth: int, peak: int) -> None:
-            rows.append((node, depth, peak))
+        # The third element is what the row's bar is drawn against. One rule --
+        # the share of the thing you are inside -- so a category is measured
+        # against everything mapped and everything below it against that
+        # category. It used to be the largest item at each level, which made a
+        # 637M node_modules and a 7.5G target both draw full bars four lines
+        # apart: the most prominent thing on the row meaning something
+        # different on every row.
+        def emit(node: Node, depth: int, whole: int, inner: int) -> None:
+            rows.append((node, depth, whole))
             if node.children and (node.expanded or filt):
-                inner_peak = max((c.size for c in node.children), default=1) or 1
                 for child in order(node.children):
                     if visible(child):
-                        emit(child, depth + 1, inner_peak)
+                        emit(child, depth + 1, inner, inner)
 
-        top_peak = max((c.size for c in self.m.categories), default=1) or 1
+        mapped = self.m.total or 1
         for cat in order(self.m.categories):
             if cat.size <= 0 and not cat.children:
                 continue
             if not hit(cat):
                 continue
-            emit(cat, 0, top_peak)
+            emit(cat, 0, mapped, cat.size or 1)
         self.rows = rows
         self.cursor = max(0, min(self.cursor, len(rows) - 1))
 
@@ -3042,10 +3078,18 @@ class Tui:
 
         bw = max(8, min(22, w // 5))
         sizew = 6
-        namespace = w - 3 - sizew - bw - 2
+        markw = 2
+        namespace = w - 3 - sizew - bw - 2 - markw
+        visible_rows = self.rows[self.top:self.top + body]
+        # The path column is as wide as what it actually holds and no wider.
+        # Since it now carries only what the label leaves out, that is often
+        # one short root repeated down the screen, and a fixed third of the
+        # width would be spent on it while the labels beside it were trimmed.
         pathw = 0
         if namespace > 54:
-            pathw = min(38, namespace // 3)
+            want = max((len(self.path_text(n)) for n, _, _ in visible_rows),
+                       default=0)
+            pathw = min(want, 38, namespace // 2)
         labelw = namespace - pathw - (2 if pathw else 0)
 
         for i in range(body):
@@ -3075,9 +3119,12 @@ class Tui:
             if selected:
                 self.put(y, 0, " " * (w - 1), curses.A_REVERSE)
                 self.put(y, 1, text, curses.A_REVERSE)
-                if self.show_path(node, pathw):
-                    self.put(y, 1 + labelw + 2, short_path(node.path, pathw),
+                if pathw:
+                    self.put(y, 1 + labelw + 2,
+                             short_path(self.path_text(node), pathw),
                              curses.A_REVERSE)
+                self.put(y, w - sizew - bw - 2 - markw, self.safety_text(node),
+                         curses.A_REVERSE)
                 self.put(y, w - sizew - bw - 2, self.size_text(node), curses.A_REVERSE)
                 self.put(y, w - bw - 1, bar(frac, bw), curses.A_REVERSE)
                 continue
@@ -3086,8 +3133,11 @@ class Tui:
             if node.stale:
                 attr |= self.DIM
             self.put(y, 1, text, attr)
-            if self.show_path(node, pathw):
-                self.put(y, 1 + labelw + 2, short_path(node.path, pathw), self.DIM)
+            self.put(y, w - sizew - bw - 2 - markw, self.safety_text(node),
+                     self.safety_attr(node))
+            if pathw:
+                self.put(y, 1 + labelw + 2,
+                         short_path(self.path_text(node), pathw), self.DIM)
             self.put(y, w - sizew - bw - 2, self.size_text(node),
                      self.YELLOW if node.blocked else self.magnitude(node.size))
             self.put(y, w - bw - 1, bar(frac, bw),

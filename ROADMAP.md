@@ -65,3 +65,15 @@ From inventory to decision.
 - [x] `0031` The browser cannot act on more than one thing <sup>feature · p2</sup>
 - [x] `0032` A machine with nothing on it is a dead end <sup>chore · p2</sup>
 
+## v1.5 — v1.5
+
+`##########` 100% · 3 of 3 done · due 2027-04-30
+
+The tree view, made honest.
+
+### done
+
+- [x] `0034` The bar draws a 637M row the same as a 7.5G row <sup>bug · p0</sup>
+- [x] `0035` The path column repeats the label instead of completing it <sup>feature · p1</sup>
+- [x] `0036` The tree does not show safety, which is what you are deciding <sup>feature · p1</sup>
+

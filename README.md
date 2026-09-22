@@ -113,17 +113,31 @@ one climbing as `du` reports the directories underneath it — so it is usable
 well before the scan finishes.
 
 ```
- ▾ PROJECT ARTIFACTS                                                        36.9G  ████████████████████
-   ▾ cargo/maven target                                                     25.3G  ████████████████████
-     parser/target                                ~/Code/parser/target       7.5G  ████████████████████
-     engine/target                                ~/Code/engine/target       4.0G  ██████████▋
-     api/target                                   ~/Code/api/target          3.8G  ██████████▏
-   ▾ node_modules                                                            7.7G  ██████▏
-     dashboard/node_modules                       ~/Code/…rd/node_modules    637M  ████████████████████
+ ▾ PROJECT ARTIFACTS                             37.5G █████████▍
+   ▾ cargo/maven target                     r    24.2G ████████████▉
+       rsst/target                 ~/Code   r     7.5G ████
+       poptop/target               ~/Code   r     4.3G ██▎
+   ▾ node_modules                            r    8.6G ████▌
+       traintime/node_modules      ~/Code   r     637M ▎
 ```
 
-Each bar is drawn against the largest item at that level, so every tier of the
-tree stays readable.
+**A bar is the share of the thing it sits inside** — a category against
+everything mapped, and everything below it against that category. So two rows
+of the same size draw the same bar wherever they are, and the 637M above reads
+as the rounding error it is.
+
+It used to be drawn against the largest item at each level, which kept every
+tier busy and made that 637M `node_modules` and the 7.5G `target` four lines
+above it both draw full. The bar is the loudest thing on the row; it should be
+the one you can trust.
+
+**The middle column carries what the label does not.** A project artifact is
+labelled by its path relative to the scan root, so all that is left to say is
+which root — worth a column when you scan several, and a narrow repeated word
+when you do not.
+
+**The mark is the safety rating**, the same `s` / `r` / `!` the summary prints:
+the list you decide from is the one that needs it.
 
 ### The area map
 
