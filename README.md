@@ -139,6 +139,36 @@ when you do not.
 **The mark is the safety rating**, the same `s` / `r` / `!` the summary prints:
 the list you decide from is the one that needs it.
 
+### The design language
+
+A terminal offers six channels, and each one here has exactly one job — because
+a channel with two jobs has none. If you have to know which column you are
+looking at before a colour means anything, you are reading the column.
+
+| channel | job |
+| --- | --- |
+| position | what kind of thing this is — the grid |
+| length | proportion. The bar, and nothing else |
+| weight | structure. **bold** heads, dim supports, normal is content |
+| hue | consequence (green, yellow, red) or interaction (cyan). Never data |
+| reverse | the cursor. Only ever the cursor |
+| glyph | state: open, closed, marked, unmeasured, a floor |
+
+Magnitude is deliberately absent from that list. The figure states it and the
+bar shows it; colouring it as well said one fact three times, and it was
+spending the channel that consequence needed — so a row used to print a red
+size beside a green mark, *enormous* and *harmless*, two columns apart.
+
+Two forms carry every label and value in the program: a **field** is a fact,
+with a dim key right-aligned in a fixed gutter, and a **hint** is something you
+can press, with a cyan key and a dim label. There is no third. One skeleton
+carries every list row — *state, name, context, consequence, quantity,
+proportion* — which is why the detail pane reads as the row you pointed at
+rather than as a different kind of thing.
+
+None of it depends on colour. A monochrome terminal loses emphasis and no
+information: every rating is a character before it is a hue.
+
 ### The area map
 
 Press `m` for a treemap: every category becomes a rectangle whose **area** is its

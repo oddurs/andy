@@ -77,3 +77,16 @@ The tree view, made honest.
 - [x] `0035` The path column repeats the label instead of completing it <sup>feature · p1</sup>
 - [x] `0036` The tree does not show safety, which is what you are deciding <sup>feature · p1</sup>
 
+## v2.0 — v2.0
+
+`##########` 100% · 4 of 4 done · due 2027-06-30
+
+A design language for the terminal.
+
+### done
+
+- [x] `0038` Colour says three different things at once <sup>bug · p0</sup>
+- [x] `0039` There is no design language, only four accumulated styles <sup>feature · p0</sup>
+- [x] `0040` The chrome spends five lines on two facts <sup>feature · p1</sup>
+- [x] `0041` The language is not enforced, so it will drift <sup>chore · p1</sup>
+

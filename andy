@@ -79,7 +79,7 @@ def xdg_path(path: str) -> str:
 
 CACHE_DIR = os.path.join(XDG_CACHE, "andy")
 CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
-VERSION = "1.2.0"
+VERSION = "2.0.0"
 
 # Only -i needs curses, and a Python built without ncurses is ordinary on the
 # minimal machines where somebody wants `andy --json` from a script. Importing
@@ -2059,14 +2059,11 @@ class Ink:
     def yellow(self, t): return self._w("33", t)
     def red(self, t): return self._w("31", t)
 
-    def magnitude(self, n: int, text: str) -> str:
-        if n >= 10 * 2 ** 30:
-            return self.red(text)
-        if n >= 2 ** 30:
-            return self.yellow(text)
-        if n >= 100 * 2 ** 20:
-            return text
-        return self.dim(text)
+    def safety_colour(self, rating: str, text: str) -> str:
+        """Any text, in the colour of a rating. The plain-text half of the
+        TUI's consequence role, so the two halves of the program agree."""
+        return {SAFE: self.green, REBUILD: self.yellow,
+                REVIEW: self.red}.get(rating, self.dim)(text)
 
     def safety(self, s: str) -> str:
         return {SAFE: self.green, REBUILD: self.yellow, REVIEW: self.red}.get(s, self.dim)(s)
@@ -2120,7 +2117,10 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
 
     p = lambda s="": print(s, file=out)
     p()
-    tight = ink.red if free < 15 * 2 ** 30 else ink.green
+    # Red when the disk is nearly full, because that is the problem. Plain
+    # otherwise: plenty of free space is not a safety rating and should not
+    # borrow the rating's green.
+    tight = ink.red if free < 15 * 2 ** 30 else (lambda text: text)
     p(f" {ink.bold('andy')}  "
       f"{ink.dim(f'{human(total)} volume {DOT} {human(used)} used {DOT} ')}"
       f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
@@ -2137,7 +2137,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
         if c.size <= 0:
             continue
         leaves = sum(1 for n in m.walk([c]) if m.is_location(n))
-        p(f"  {c.label.ljust(labelw)}{ink.magnitude(c.size, human(c.size, pad=True))}  "
+        p(f"  {c.label.ljust(labelw)}{human(c.size, pad=True)}  "
           f"{ink.accent(bar(c.size / biggest, barw))} {ink.dim(str(leaves))}")
     p(f"  {'':{labelw}}{ink.dim(RULE * 5)}")
     share = f"{m.total / used * 100:.0f}% of used space" if used else ""
@@ -2161,7 +2161,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
         namew = min(namew, max(18, w // 3))
         for n in items:
             room = w - namew - 22
-            p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
+            p(f"  {human(n.size, pad=True)}  "
               f"{ink.safety(MARK.get(n.safety, '?'))}  "
               f"{short_path(n.label, namew).ljust(namew)}  "
               f"{ink.dim(short_path(n.path, room))}")
@@ -2174,7 +2174,7 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     blocked = [n for n in m.walk() if n.blocked]
     if blocked:
         p()
-        p(f" {ink.yellow('still counting when time ran out')}  "
+        p(f" {ink.bold('still counting when time ran out')}  "
           f"{ink.dim(str(len(blocked)) + (' location' if len(blocked) == 1 else ' locations'))}")
         for n in blocked[:4]:
             if n.partial:
@@ -2252,7 +2252,10 @@ def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
         heading("changed", f"{len(grew)} location{'s' if len(grew) != 1 else ''}")
         for n in grew[:limit]:
             change = n.size - n.before
-            paint = ink.red if change > 0 else ink.green
+            # The sign says which way it moved. The colour says what it always
+            # says -- what removing it would cost -- so a 4G jump you can delete
+            # without thinking reads differently from one you cannot.
+            paint = lambda text, rating=n.safety: ink.safety_colour(rating, text)
             p(f"  {paint(signed(change).rjust(7))}  "
               f"{short_path(n.label, namew).ljust(namew)}  "
               f"{ink.dim(human(n.before) + ' ' + RIGHT + ' ' + human(n.size))}")
@@ -2265,7 +2268,7 @@ def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
                        f"{'s' if len(fresh) != 1 else ''} andy had not measured "
                        f"before, which may mean created or merely recognised")
         for n in fresh[:limit]:
-            p(f"  {ink.magnitude(n.size, human(n.size, pad=True))}  "
+            p(f"  {human(n.size, pad=True)}  "
               f"{short_path(n.label, namew).ljust(namew)}  "
               f"{ink.dim(short_path(n.path, max(10, w - namew - 14)))}")
         if len(fresh) > limit:
@@ -2277,13 +2280,13 @@ def print_delta(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
                         f"{'s' if len(m.vanished) != 1 else ''} measured before "
                         f"and not there now")
         for path, size in m.vanished[:limit]:
-            p(f"  {ink.green(('-' + human(size)).rjust(7))}  "
+            p(f"  {('-' + human(size)).rjust(7)}  "
               f"{ink.dim(short_path(path, w - 12))}")
         if len(m.vanished) > limit:
             p(f"  {ink.dim(f'... and {len(m.vanished) - limit} more')}")
         p()
 
-    paint = ink.red if changed > 0 else ink.green
+    paint = lambda text: text       # a net across ratings has no single cost
     p(f"  {ink.bold('net')}  {paint(signed(changed))}  "
       f"{ink.dim(f'across the {len(grew)} location' + ('s' if len(grew) != 1 else '') + ' andy could compare')}")
     p()
@@ -2318,7 +2321,7 @@ def print_tree(m: Model, ink: Ink, min_bytes: int, out=sys.stdout) -> None:
                     continue        # too small to show, and so is everything in it
                 pad = "  " + "  " * depth
                 label = short_path(child.label, max(20, w - len(pad) - 30))
-                p(f"{pad}{ink.magnitude(child.size, human(child.size, pad=True))}  {label}")
+                p(f"{pad}{human(child.size, pad=True)}  {label}")
                 emit(child, depth + 1)
 
         emit(c, 1)
@@ -2808,6 +2811,76 @@ class Tui:
                 self.use_mouse = False
         self.styles()
 
+    # ------------------------------------------------------------------ #
+    # The design language
+    # ------------------------------------------------------------------ #
+    #
+    # A terminal gives six channels. Each has exactly one job here, because a
+    # channel with two jobs has none: a reader who must know which column they
+    # are looking at before a colour means anything is reading the column, not
+    # the colour.
+    #
+    #   position   what kind of thing this is -- the grid
+    #   length     proportion. The bar, and nothing else
+    #   weight     structure. bold heads, dim supports, normal is content
+    #   hue        consequence (warm) or interaction (cyan). Never data
+    #   reverse    the cursor. Only ever the cursor
+    #   glyph      state: open, closed, marked, unmeasured, a floor
+    #
+    # Magnitude is deliberately absent. The figure states it and the bar shows
+    # it; colouring it as well said one fact three times and spent the channel
+    # that consequence needed.
+    #
+    # Two forms carry every label-and-value in the program:
+    #
+    #   field(key, value)   a fact           dim key in a gutter, value beside
+    #   hint(key, label)    something to press   cyan key, dim label
+    #
+    # And one skeleton carries every list row:
+    #
+    #   state . name . context . consequence . quantity . proportion
+    #
+    # Roles below are the only way to reach an attribute. Nothing outside this
+    # block names a curses constant, and tests/test_language.py checks that.
+
+    GUTTER = 8          # where a field's value begins
+
+    def heading(self) -> int:
+        """A category, a pane title, the name of the thing in focus."""
+        return curses.A_BOLD
+
+    def content(self) -> int:
+        """An ordinary row."""
+        return curses.A_NORMAL
+
+    def supporting(self) -> int:
+        """Present but secondary: field keys, paths, units, counts, rules."""
+        return self._dim
+
+    def interactive(self) -> int:
+        """Something that responds to a key or the mouse."""
+        return self._cyan
+
+    def selected(self) -> int:
+        """The cursor, and nothing else."""
+        return curses.A_REVERSE
+
+    def consequence(self, safety: str) -> int:
+        """What removing it would cost. The only use of the warm scale."""
+        return {SAFE: self._green, REBUILD: self._yellow,
+                REVIEW: self._red}.get(safety, self._dim)
+
+    def field(self, y: int, x: int, key: str, value: str, attr: int = 0) -> None:
+        """A fact: `mapped   79.9G`."""
+        self.put(y, x, key.rjust(self.GUTTER - 1), self.supporting())
+        self.put(y, x + self.GUTTER, value, attr or self.content())
+
+    def hint(self, y: int, x: int, key: str, label: str) -> int:
+        """Something you can press. Returns the width it used."""
+        self.put(y, x, key, self.interactive())
+        self.put(y, x + len(key) + 1, label, self.supporting())
+        return len(key) + 1 + len(label)
+
     def styles(self) -> None:
         """Colour pairs, attributes and the mouse bitmasks.
 
@@ -2843,11 +2916,13 @@ class Tui:
         except Exception:
             self.colour = False
             self.map_pairs = []
-        self.ACCENT = curses.color_pair(1) if self.colour else curses.A_BOLD
-        self.RED = curses.color_pair(2) if self.colour else curses.A_NORMAL
-        self.YELLOW = curses.color_pair(3) if self.colour else curses.A_NORMAL
-        self.GREEN = curses.color_pair(4) if self.colour else curses.A_NORMAL
-        self.DIM = curses.A_DIM
+        # The palette. Private on purpose: every drawing call asks for a role,
+        # so a hue can only ever mean the one thing its role means.
+        self._cyan = curses.color_pair(1) if self.colour else curses.A_BOLD
+        self._red = curses.color_pair(2) if self.colour else curses.A_NORMAL
+        self._yellow = curses.color_pair(3) if self.colour else curses.A_NORMAL
+        self._green = curses.color_pair(4) if self.colour else curses.A_NORMAL
+        self._dim = curses.A_DIM
 
     def put(self, y: int, x: int, text: str, attr: int = 0) -> None:
         h, w = self.s.getmaxyx()
@@ -2868,15 +2943,6 @@ class Tui:
             if zy == y and x0 <= x <= x1:
                 return kind, payload
         return None, None
-
-    def magnitude(self, n: int) -> int:
-        if n >= 10 * 2 ** 30:
-            return self.RED
-        if n >= 2 ** 30:
-            return self.YELLOW
-        if n >= 100 * 2 ** 20:
-            return curses.A_NORMAL
-        return self.DIM
 
     @staticmethod
     def path_text(node: Node) -> str:
@@ -2912,10 +2978,6 @@ class Tui:
         if not node.cmd and not node.path:
             return " "
         return MARK.get(node.safety, " ")
-
-    def safety_attr(self, node: Node) -> int:
-        return {SAFE: self.GREEN, REBUILD: self.YELLOW,
-                REVIEW: self.RED}.get(node.safety, self.DIM)
 
     @staticmethod
     def size_text(node: Node) -> str:
@@ -2993,9 +3055,9 @@ class Tui:
 
     def geometry(self):
         h, w = self.s.getmaxyx()
-        head = 5
+        head = 3            # title, facts, rule -- see draw_header
         foot = 1
-        detail = 6 if self.detail and h >= 20 else 0
+        detail = 5 if self.detail and h >= 18 else 0
         body = max(1, h - head - foot - detail)
         return h, w, head, body, detail, foot
 
@@ -3025,50 +3087,50 @@ class Tui:
         curses.doupdate()
 
     def draw_header(self, w: int) -> None:
+        """Three lines: what this is and how it is going, the two facts, a rule.
+
+        It was five, two of them rules with nothing between them that needed
+        separating. A rule marks a boundary between panes; anything else it
+        does is decoration paid for in rows of the disk you came to see.
+        """
         m = self.m
         total, used, free = m.disk
-        pct = used / total if total else 0.0
+
         self.put(0, 0, " " * (w - 1))
-        self.put(0, 1, "andy", curses.A_BOLD)
+        self.put(0, 1, "andy", self.heading())
         if m.finished:
-            right = f"{m.count} locations {DOT} {m.elapsed:.1f}s"
-            attr = self.DIM
+            state, attr = f"{m.count} locations {DOT} {m.elapsed:.1f}s", self.supporting()
         else:
-            right = (f"{SPINNER[self.tick % len(SPINNER)]} {m.phase} "
+            state = (f"{SPINNER[self.tick % len(SPINNER)]} {m.phase} "
                      f"{m.done}/{max(m.pending, 1)}")
-            attr = self.ACCENT
-        self.put(0, max(11, w - len(right) - 2), right, attr)
-        self.put(1, 1, RULE * max(0, w - 2), self.DIM)
+            attr = self.interactive()
+        self.put(0, max(11, w - len(state) - 2), state, attr)
 
+        # Both facts on one line, in the one field form, because they are the
+        # same kind of fact: what the volume holds, and how much of it is this.
         low = free < 15 * 2 ** 30
-        self.put(2, 1, "volume", self.DIM)
-        lead = f"{human(total)} {DOT} {human(used)} used {DOT} "
+        self.field(1, 1, "volume", f"{human(total)} {DOT} {human(used)} used {DOT} ")
+        x = 1 + self.GUTTER + len(f"{human(total)} {DOT} {human(used)} used {DOT} ")
         free_text = f"{human(free)} free"
-        self.put(2, 9, lead)
-        x = 9 + len(lead)
-        self.put(2, x, free_text, self.RED if low else self.GREEN)
+        # Red here is consequence, not magnitude: a full disk is the problem.
+        self.put(1, x, free_text, self.consequence(REVIEW) if low else self.content())
         x += len(free_text) + 2
-        # size the bar from what is actually left, so the percentage never clips
-        pct_text = f"{pct * 100:.0f}%"
-        bw = min(24, w - 2 - x - len(pct_text) - 1)
-        if bw >= 6:
-            self.put(2, x, bar(pct, bw), self.RED if low else self.ACCENT)
-            self.put(2, x + bw + 1, pct_text, self.DIM)
-        elif x + len(pct_text) < w - 1:
-            self.put(2, x, pct_text, self.DIM)
 
-        share = f"{m.total / used * 100:.0f}% of used space" if used else ""
-        self.put(3, 1, "mapped", self.DIM)
-        self.put(3, 9, human(m.total), curses.A_BOLD | self.magnitude(m.total))
-        self.put(3, 9 + len(human(m.total)) + 2, share, self.DIM)
+        mapped = f"{human(m.total)} mapped"
+        share = f"{DOT} {m.total / used * 100:.0f}% of used" if used else ""
+        if x + len(mapped) + len(share) < w - 2:
+            self.put(1, x, mapped, self.content())
+            self.put(1, x + len(mapped) + 1, share, self.supporting())
+
         if self.filter:
-            tag = f"filter: {self.filter}" + (FULL_CELL if self.typing else "")
-            self.put(3, max(40, w - len(tag) - 2), tag, self.ACCENT)
-        self.put(4, 1, RULE * max(0, w - 2), self.DIM)
+            tag = f"/{self.filter}" + (FULL_CELL if self.typing else "")
+            self.put(1, max(x, w - len(tag) - 2), tag, self.interactive())
+        self.put(2, 1, RULE * max(0, w - 2), self.supporting())
 
     def draw_body(self, y0: int, body: int, w: int) -> None:
         if not self.rows:
-            self.put(y0 + 1, 3, "no matches" if self.filter else "scanning" + ELLIPSIS, self.DIM)
+            self.put(y0 + 1, 3, "no matches" if self.filter else "scanning" + ELLIPSIS,
+                     self.supporting())
             return
         if self.cursor < self.top:
             self.top = self.cursor
@@ -3117,31 +3179,32 @@ class Tui:
             frac = node.size / peak if peak else 0.0
 
             if selected:
-                self.put(y, 0, " " * (w - 1), curses.A_REVERSE)
-                self.put(y, 1, text, curses.A_REVERSE)
+                self.put(y, 0, " " * (w - 1), self.selected())
+                self.put(y, 1, text, self.selected())
                 if pathw:
                     self.put(y, 1 + labelw + 2,
                              short_path(self.path_text(node), pathw),
-                             curses.A_REVERSE)
+                             self.selected())
                 self.put(y, w - sizew - bw - 2 - markw, self.safety_text(node),
-                         curses.A_REVERSE)
-                self.put(y, w - sizew - bw - 2, self.size_text(node), curses.A_REVERSE)
-                self.put(y, w - bw - 1, bar(frac, bw), curses.A_REVERSE)
+                         self.selected())
+                self.put(y, w - sizew - bw - 2, self.size_text(node), self.selected())
+                self.put(y, w - bw - 1, bar(frac, bw), self.selected())
                 continue
 
-            attr = curses.A_BOLD if depth == 0 else curses.A_NORMAL
+            attr = self.heading() if depth == 0 else self.content()
             if node.stale:
-                attr |= self.DIM
+                attr |= self.supporting()
             self.put(y, 1, text, attr)
             self.put(y, w - sizew - bw - 2 - markw, self.safety_text(node),
-                     self.safety_attr(node))
+                     self.consequence(node.safety))
             if pathw:
                 self.put(y, 1 + labelw + 2,
-                         short_path(self.path_text(node), pathw), self.DIM)
-            self.put(y, w - sizew - bw - 2, self.size_text(node),
-                     self.YELLOW if node.blocked else self.magnitude(node.size))
+                         short_path(self.path_text(node), pathw), self.supporting())
+            # No colour on a size. The figure states it and the bar shows it;
+            # a third telling would spend the channel consequence needs.
+            self.put(y, w - sizew - bw - 2, self.size_text(node), self.content())
             self.put(y, w - bw - 1, bar(frac, bw),
-                     self.ACCENT if depth == 0 else self.DIM)
+                     self.content() if depth == 0 else self.supporting())
 
         self.draw_scrollbar(y0, body, w)
 
@@ -3151,16 +3214,16 @@ class Tui:
         trail = f" {CRUMB} ".join(n.label for n in self.map_stack) or "all categories"
         total = sum(n.size for n in level if not n.informational)
         head = f"{trail}" + (f"   {LEFT} back" if self.map_stack else "")
-        self.put(y0, 1, shorten(head, w - 16), curses.A_BOLD)
+        self.put(y0, 1, shorten(head, w - 16), self.heading())
         shown = len([n for n in level if n.size > 0 and not n.informational])
         right = f"{human(total)} in {shown}"
-        self.put(y0, max(20, w - len(right) - 2), right, self.DIM)
+        self.put(y0, max(20, w - len(right) - 2), right, self.supporting())
         if self.map_stack:
             self.zone(y0, 1, w - 2, "mapup")
 
         area_h = body - 2
         if area_h < 2 or w < 20:
-            self.put(y0 + 2, 1, "not enough room for the map", self.DIM)
+            self.put(y0 + 2, 1, "not enough room for the map", self.supporting())
             self.map_cells = []
             return
 
@@ -3168,9 +3231,9 @@ class Tui:
         if skipped:
             small = sum(n.size for n in skipped)
             tag = f"+{len(skipped)} too small to draw {DOT} {human(small)}"
-            self.put(y0 + 1, 1, tag, self.DIM)
+            self.put(y0 + 1, 1, tag, self.supporting())
         if not self.map_cells:
-            self.put(y0 + 2, 1, "nothing measured yet" + ELLIPSIS, self.DIM)
+            self.put(y0 + 2, 1, "nothing measured yet" + ELLIPSIS, self.supporting())
             return
         self.map_sel = max(0, min(self.map_sel, len(self.map_cells) - 1))
 
@@ -3180,15 +3243,22 @@ class Tui:
             # while staying monotone in size, so the ramp still reads as magnitude
             t = (node.size / biggest) ** 0.5
             step = min(len(MAP_RAMP) - 1, max(0, round((1 - t) * (len(MAP_RAMP) - 1))))
-            fill = self.map_pairs[step] if self.map_pairs else curses.A_REVERSE
+            # With a colour ramp the fill separates neighbouring cells. Without
+            # one there is no fill: the cells are drawn as outlines instead, so
+            # that reverse video can go on meaning the selection and nothing
+            # else.
+            fill = self.map_pairs[step] if self.map_pairs else self.content()
             if i == self.map_sel:
-                fill |= curses.A_REVERSE
+                fill |= self.selected()
             dw, dh = max(1, cw - 1), max(1, ch - 1)
             for r in range(dh):
-                self.put(cy + r, cx, " " * dw, fill)
+                if self.map_pairs or i == self.map_sel:
+                    self.put(cy + r, cx, " " * dw, fill)
+                elif r in (0, dh - 1):
+                    self.put(cy + r, cx, RULE * dw, self.supporting())
                 self.zone(cy + r, cx, cx + dw - 1, "cell", i)
             if dw >= 4:
-                self.put(cy, cx, clip_end(node.label, dw), fill | curses.A_BOLD)
+                self.put(cy, cx, clip_end(node.label, dw), fill | self.heading())
             if dh >= 2 and dw >= 5:
                 self.put(cy + 1, cx, clip_end(human(node.size), dw), fill)
             if dh >= 4 and dw >= 12 and total:
@@ -3204,7 +3274,7 @@ class Tui:
         for i in range(body):
             self.zone(y0 + i, 0, 0, "scroll", i)
             if top <= i < top + height:
-                self.put(y0 + i, 0, SCROLLBAR, self.ACCENT)
+                self.put(y0 + i, 0, SCROLLBAR, self.interactive())
 
     def parent_of(self, target: Node) -> Node | None:
         stack = list(self.m.categories)
@@ -3217,67 +3287,81 @@ class Tui:
         return None
 
     def draw_detail(self, y0: int, height: int, w: int) -> None:
-        self.put(y0, 1, RULE * max(0, w - 2), self.DIM)
+        """What is in focus, in the field form, on four lines.
+
+        Name and size on the first, because that is the row you pointed at;
+        then one field per fact, each key in the same gutter as the header's,
+        so the eye learns one column and keeps it.
+        """
+        self.put(y0, 1, RULE * max(0, w - 2), self.supporting())
         node = self.focus()
         if node is None:
             return
+
+        # Name, consequence, quantity -- the same order and the same meanings
+        # as a row in the tree, so the pane reads as the row you pointed at
+        # rather than as a different kind of thing.
         size = human(node.size)
-        self.put(y0 + 1, 1, shorten(node.label, w - len(size) - 6), curses.A_BOLD)
-        self.put(y0 + 1, w - len(size) - 2, size, curses.A_BOLD | self.magnitude(node.size))
+        rating = (SAFETY_TEXT.get(node.safety, node.safety)
+                  if (node.cmd or node.path) else "")
+        if rating and w < len(rating) + len(size) + 30:
+            rating = node.safety          # the word alone when the line is tight
+        rx = w - len(size) - len(rating) - 4
+        self.put(y0 + 1, 1, shorten(node.label, max(1, rx - 2)), self.heading())
+        if rating:
+            self.put(y0 + 1, rx, rating, self.consequence(node.safety))
+        self.put(y0 + 1, w - len(size) - 2, size, self.heading())
 
         if node.path:
-            self.put(y0 + 2, 1, shorten(node.path, w - 3), self.DIM)
+            self.field(y0 + 2, 1, "where", shorten(node.path, w - self.GUTTER - 3),
+                       self.supporting())
             self.zone(y0 + 2, 1, w - 2, "copypath")
         elif node.children:
             biggest = max(node.children, key=lambda c: c.size)
             leaves = sum(1 for n in self.m.walk([node]) if self.m.is_location(n))
             summary = (f"{leaves} location{'s' if leaves != 1 else ''} {DOT} "
                        f"largest is {biggest.label} at {human(biggest.size)}")
-            self.put(y0 + 2, 1, shorten(summary, w - 3), self.DIM)
+            self.field(y0 + 2, 1, "holds", shorten(summary, w - self.GUTTER - 3),
+                       self.supporting())
 
         note = node.note
+        attr = self.content()
         if node.blocked:
             if node.partial:
-                extra = f" Counted {human(node.size)} before giving up, so it is at least that."
+                extra = (f" Counted {human(node.size)} before giving up, so it is "
+                         f"at least that.")
             elif node.measured:
                 extra = " Showing the previous scan's figure."
             else:
                 extra = " Nothing was counted."
             note = f"incomplete {DASH} " + BLOCKED_HINT + extra
+            attr = self.consequence(REVIEW)
+        elif node.informational:
+            note = "counted inside the entry above, not added to the total"
+            attr = self.supporting()
         if note:
-            self.put(y0 + 3, 1, shorten(note, w - 3),
-                     self.RED if node.blocked else 0)
-        if node.cmd:
-            self.put(y0 + 4, 1, "reclaim", self.DIM)
-            self.put(y0 + 4, 9, shorten(self.command_for(node), w - 12), self.ACCENT)
-            self.zone(y0 + 4, 1, w - 2, "copycmd")
-        elif node.path:
-            self.put(y0 + 4, 1, "reclaim", self.DIM)
-            self.put(y0 + 4, 9, f"no single command {DASH} inspect it first", self.DIM)
+            self.field(y0 + 3, 1, "what", shorten(note, w - self.GUTTER - 3), attr)
 
-        if height >= 6:
-            # a grouping row is not a thing you can delete, so it gets no rating
-            if node.cmd or node.path:
-                col = {SAFE: self.GREEN, REBUILD: self.YELLOW,
-                       REVIEW: self.RED}.get(node.safety, self.DIM)
-                self.put(y0 + 5, 1, "safety", self.DIM)
-                self.put(y0 + 5, 9, SAFETY_TEXT.get(node.safety, node.safety), col)
-            if node.informational:
-                self.put(y0 + 5, 1, "counted", self.DIM)
-                self.put(y0 + 5, 9, "inside the entry above, not added to the total",
-                         self.DIM)
-            hint = f"c copy command {DOT} y copy path"
-            if w > 78:
-                self.put(y0 + 5, w - len(hint) - 2, hint, self.DIM)
+        if height >= 5:
+            if node.cmd:
+                self.field(y0 + 4, 1, "reclaim",
+                           shorten(self.command_for(node), w - self.GUTTER - 3))
+                self.zone(y0 + 4, 1, w - 2, "copycmd")
+            elif node.path:
+                self.field(y0 + 4, 1, "reclaim",
+                           f"no single command {DASH} inspect it first",
+                           self.supporting())
 
     def draw_footer(self, y: int, w: int) -> None:
         self.put(y, 0, " " * (w - 1))
         if time.time() < self.message_until:
-            self.put(y, 1, self.message, self.ACCENT | curses.A_BOLD)
+            # a toast is the program answering you, so it is interaction
+            self.put(y, 1, self.message, self.interactive())
             return
         if self.typing:
-            self.put(y, 1, f"/{self.filter}{FULL_CELL}   "
-                           f"enter keep {DOT} esc clear", self.ACCENT)
+            self.put(y, 1, f"/{self.filter}{FULL_CELL}", self.interactive())
+            self.put(y, 4 + len(self.filter), f"enter keep {DOT} esc clear",
+                     self.supporting())
             return
         # every segment is a click target as well as a key hint
         if self.view == "map":
@@ -3307,8 +3391,11 @@ class Tui:
         x = 1
         for key, label, kind in items:
             span = len(key) + 1 + len(label)
-            self.put(y, x, key, self.ACCENT if kind else self.DIM)
-            self.put(y, x + len(key) + 1, label, self.DIM)
+            if kind:
+                self.hint(y, x, key, label)
+            else:
+                self.put(y, x, key, self.supporting())
+                self.put(y, x + len(key) + 1, label, self.supporting())
             if kind:
                 self.zone(y, x, x + span - 1, kind)
             x += span + 3
@@ -3347,25 +3434,29 @@ class Tui:
         bw = min(w - 4, colw * (2 if two else 1) + (8 if two else 6))
         bh = min(h - 2, rows + 4)
         y0, x0 = (h - bh) // 2, (w - bw) // 2
+        # Cleared, then framed with the rule the panes use. It was drawn
+        # entirely in reverse video, which made the help look like a
+        # window-sized cursor -- reverse is the cursor, and only the cursor.
         for i in range(bh):
-            self.put(y0 + i, x0, " " * bw, curses.A_REVERSE)
-        self.put(y0 + 1, x0 + 2, f"andy {DASH} keys", curses.A_REVERSE | curses.A_BOLD)
+            self.put(y0 + i, x0, " " * bw)
+        self.put(y0, x0, RULE * bw, self.supporting())
+        self.put(y0 + bh - 1, x0, RULE * bw, self.supporting())
+        self.put(y0 + 1, x0 + 2, f"andy {DASH} keys", self.heading())
 
         def column(lines, cx, room):
             for i, (key, desc) in enumerate(lines[:room]):
                 y = y0 + 3 + i
                 if not desc:
-                    self.put(y, cx, key, curses.A_REVERSE | curses.A_BOLD)
+                    self.put(y, cx, key, self.heading())
                 else:
-                    self.put(y, cx + 1, key.ljust(keyw), curses.A_REVERSE)
-                    self.put(y, cx + 1 + keyw + 1, desc, curses.A_REVERSE)
+                    self.hint(y, cx + 1, key.ljust(keyw), desc)
 
-        room = bh - 4
+        room = bh - 5
         column(left, x0 + 2, room)
         if right:
             column(right, x0 + 4 + colw, room)
         tail = "any key to close"
-        self.put(y0 + bh - 1, x0 + bw - len(tail) - 2, tail, curses.A_REVERSE)
+        self.put(y0 + bh - 2, x0 + bw - len(tail) - 2, tail, self.supporting())
 
     # -- input --------------------------------------------------------------- #
 
