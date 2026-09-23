@@ -121,6 +121,7 @@ if UNICODE:
     DOT, RULE, ELLIPSIS, ATLEAST = "\u00b7", "\u2500", "\u2026", "\u2265"
     CLOSED, OPENED, SCROLLBAR = "\u25b8", "\u25be", "\u258c"
     CORNERS, EDGE = "\u250c\u2510\u2514\u2518", "\u2502"
+    TRACK = "\u00b7"
     ENTER = "\u21b5"
     DASH = "\u2014"
     CRUMB = "\u203a"
@@ -132,6 +133,7 @@ else:
     DOT, RULE, ELLIPSIS, ATLEAST = "*", "-", "...", ">="
     CLOSED, OPENED, SCROLLBAR = ">", "v", "|"
     CORNERS, EDGE = "++++", "|"
+    TRACK = "."
     ENTER = "enter"
     DASH = "--"
     CRUMB = ">"
@@ -243,18 +245,30 @@ def short_path(text: str, width: int) -> str:
     return ELLIPSIS + text[-(width - len(ELLIPSIS)):]
 
 
-def bar(fraction: float, width: int) -> str:
-    """A horizontal bar with one-eighth-cell precision."""
+def bar_parts(fraction: float, width: int) -> tuple[str, str]:
+    """A bar and the track it sits in, together exactly `width` wide.
+
+    Drawn separately because they are different things: the bar is the
+    measurement and the track is furniture, so the track can be the theme's
+    middle tone and the bar can carry the colour. Without one a bar floats,
+    and two bars on neighbouring rows share no visible scale.
+    """
     if width <= 0:
-        return ""
+        return "", ""
     fraction = max(0.0, min(1.0, fraction))
     eighths = int(round(fraction * width * 8))
     full, rem = divmod(eighths, 8)
     full = min(full, width)
-    out = FULL_CELL * full
+    filled = FULL_CELL * full
     if rem and full < width:
-        out += PARTIAL_CELLS[rem - 1]
-    return out.ljust(width)
+        filled += PARTIAL_CELLS[rem - 1]
+    return filled, TRACK * (width - len(filled))
+
+
+def bar(fraction: float, width: int) -> str:
+    """A horizontal bar with one-eighth-cell precision, in its track."""
+    filled, track = bar_parts(fraction, width)
+    return filled + track
 
 
 # Whoever answers first. Wayland before X11, because a Wayland session usually
@@ -1657,6 +1671,17 @@ class Model:
         self.total = sum(c.size for c in self.categories)
         self.count = sum(1 for n in self.walk() if self.is_location(n))
 
+    def dominant_safety(self, node: Node) -> str | None:
+        """The rating holding the most bytes inside a node, or None if it
+        holds no rated locations at all."""
+        weight: dict[str, int] = {}
+        for inside in self.walk([node]):
+            if self.is_location(inside):
+                weight[inside.safety] = weight.get(inside.safety, 0) + inside.size
+        if not weight:
+            return node.safety if (node.cmd or node.path) else None
+        return max(weight, key=weight.get)
+
     def by_safety(self) -> dict[str, int]:
         """Mapped bytes split by how safe they are to remove.
 
@@ -2059,8 +2084,8 @@ def project_label(path: str, roots: list[str]) -> str:
 
 ANSI = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
 STYLE_ATTRS = ("bold", "dim", "underline", "reverse")
-ROLE_NAMES = ("heading", "content", "supporting", "interactive", "selected",
-              SAFE, REBUILD, REVIEW)
+ROLE_NAMES = ("heading", "content", "supporting", "muted", "interactive",
+              "selected", SAFE, REBUILD, REVIEW)
 MAP_STYLES = ("outline", "shade")
 
 THEMES: dict[str, dict[str, str]] = {
@@ -2071,18 +2096,21 @@ THEMES: dict[str, dict[str, str]] = {
     # dark, whatever the user has chosen. The map is outlined rather than
     # shaded, because a shade would have to be a colour andy picked.
     "terminal": {"heading": "bold", "content": "", "supporting": "dim",
+                 "muted": "bright-black",
                  "interactive": "cyan", "selected": "on surface bold",
                  SAFE: "green", REBUILD: "yellow", REVIEW: "red",
                  "map": "outline"},
     # No colour at all: what NO_COLOR gives you, chosen on purpose. Every
     # rating is still its character; "look first" keeps its weight.
     "mono": {"heading": "bold", "content": "", "supporting": "dim",
+                 "muted": "dim",
              "interactive": "bold", "selected": "reverse",
              SAFE: "", REBUILD: "", REVIEW: "bold", "map": "outline"},
     # The 1.x look: the same roles, and a map shaded in xterm-256 greys where
     # the terminal has them. Does not inherit, which is why it is not the
     # default.
     "classic": {"heading": "bold", "content": "", "supporting": "dim",
+                 "muted": "bright-black",
                 "interactive": "cyan", "selected": "reverse",
                 SAFE: "green", REBUILD: "yellow", REVIEW: "red",
                 "map": "shade"},
@@ -2408,9 +2436,11 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
     # otherwise: plenty of free space is not a safety rating and should not
     # borrow the rating's green.
     tight = ink.review if free < 15 * 2 ** 30 else (lambda text: text)
+    filled, track = bar_parts(pct, 18)
     p(f" {ink.bold('andy')}  "
       f"{ink.dim(f'{human(total)} volume {DOT} {human(used)} used {DOT} ')}"
-      f"{tight(human(free) + ' free')}  {bar(pct, 18)} {pct * 100:.0f}%")
+      f"{tight(human(free) + ' free')}  "
+      f"{tight(filled)}{ink.dim(track)} {pct * 100:.0f}%")
     p()
 
     if not m.categories or not m.total:
@@ -2424,8 +2454,11 @@ def print_report(m: Model, ink: Ink, top: int, out=sys.stdout) -> None:
         if c.size <= 0:
             continue
         leaves = sum(1 for n in m.walk([c]) if m.is_location(n))
+        # A category has no single rating, so its bar takes no hue -- and never
+        # the accent, which belongs to things you can press.
+        cat_filled, cat_track = bar_parts(c.size / biggest, barw)
         p(f"  {c.label.ljust(labelw)}{human(c.size, pad=True)}  "
-          f"{ink.accent(bar(c.size / biggest, barw))} {ink.dim(str(leaves))}")
+          f"{cat_filled}{ink.dim(cat_track)} {ink.dim(str(leaves))}")
     p(f"  {'':{labelw}}{ink.dim(RULE * 5)}")
     share = f"{m.total / used * 100:.0f}% of used space" if used else ""
     p(f"  {ink.bold('total'.ljust(labelw))}{ink.bold(human(m.total, pad=True))}  {ink.dim(share)}")
@@ -3367,6 +3400,9 @@ class Tui:
     #   position   what kind of thing this is -- the grid
     #   length     proportion. The bar, and nothing else
     #   weight     structure. bold heads, dim supports, normal is content
+    #   tone       four steps: heading, content, supporting, muted. The last is
+    #              furniture -- rules, outlines, the track behind a bar -- and
+    #              is never text
     #   hue        consequence (warm) or interaction (cyan). Never data
     #   reverse    the cursor. Only ever the cursor
     #   glyph      state: open, closed, marked, unmeasured, a floor
@@ -3398,8 +3434,15 @@ class Tui:
         return self._roles["content"]
 
     def supporting(self) -> int:
-        """Present but secondary: field keys, paths, units, counts, rules."""
+        """Present but secondary, but still read: field keys, paths, counts."""
         return self._roles["supporting"]
+
+    def muted(self) -> int:
+        """Furniture, never text: pane rules, map outlines, the track a bar
+        sits in. The theme's own middle tone, which lands around 3.7:1 against
+        the background -- under what text needs and exactly what something you
+        see past should be."""
+        return self._roles["muted"]
 
     def interactive(self) -> int:
         """Something that responds to a key or the mouse."""
@@ -3417,6 +3460,15 @@ class Tui:
     def consequence(self, safety: str) -> int:
         """What removing it would cost. The only use of the warm scale."""
         return self._roles.get(safety, self._roles["supporting"])
+
+    def tint(self, safety: str) -> int:
+        """The same meaning at field strength, for an area rather than a mark.
+
+        A bar the width of the screen in a full-strength hue is a warning; the
+        same hue dimmed is a wash, which is what a field of them should be. The
+        mark beside it keeps full strength, so precision stays with the
+        character and mood goes to the field."""
+        return self.consequence(safety) | curses.A_DIM
 
     def field(self, y: int, x: int, key: str, value: str, attr: int = 0) -> None:
         """A fact: `mapped   79.9G`."""
@@ -3736,7 +3788,7 @@ class Tui:
         if self.filter:
             tag = f"/{self.filter}" + (FULL_CELL if self.typing else "")
             self.put(1, max(x, w - len(tag) - 2), tag, self.interactive())
-        self.put(2, 1, RULE * max(0, w - 2), self.supporting())
+        self.put(2, 1, RULE * max(0, w - 2), self.muted())
 
     def draw_body(self, y0: int, body: int, w: int) -> None:
         if not self.rows:
@@ -3799,10 +3851,13 @@ class Tui:
                 self.put(y, w - sizew - bw - 2 - markw, self.safety_text(node),
                          self.lift(node.safety))
                 self.put(y, w - sizew - bw - 2, self.size_text(node), self.selected())
-                self.put(y, w - bw - 1, bar(frac, bw), self.selected())
+                filled, track = bar_parts(frac, bw)
+                self.put(y, w - bw - 1, filled, self.selected())
+                self.put(y, w - bw - 1 + len(filled), track, self.lift("muted"))
                 continue
 
-            attr = self.heading() if depth == 0 else self.content()
+            attr = (self.heading() if depth == 0 else
+                    self.supporting() if node.detail else self.content())
             if node.stale:
                 attr |= self.supporting()
             self.put(y, 1, text, attr)
@@ -3814,8 +3869,16 @@ class Tui:
             # No colour on a size. The figure states it and the bar shows it;
             # a third telling would spend the channel consequence needs.
             self.put(y, w - sizew - bw - 2, self.size_text(node), self.content())
-            self.put(y, w - bw - 1, bar(frac, bw),
-                     self.content() if depth == 0 else self.supporting())
+            # The bar carries two facts: how much, by length, and what removing
+            # it would cost, by hue -- dimmed, so a screenful reads as a wash
+            # rather than a warning. The mark keeps full strength, so precision
+            # stays with the character. A category has no single rating.
+            filled, track = bar_parts(frac, bw)
+            rated = node.safety if (node.cmd or node.path) else None
+            tint = self.tint(rated) if rated else (
+                self.content() if depth == 0 else self.supporting())
+            self.put(y, w - bw - 1, filled, tint)
+            self.put(y, w - bw - 1 + len(filled), track, self.muted())
 
         self.draw_scrollbar(y0, body, w)
 
@@ -3895,11 +3958,19 @@ class Tui:
         costs no extra row.
         """
         tl, tr, bl, br = CORNERS
-        edge = self.supporting()
+        edge = self.muted()
         if dw < 4 or dh < 2:
             # too small for a box: the label alone still says what it is
             self.put(y, x, clip_end(node.label, dw), self.heading())
             return
+        # Area is the magnitude; the frame is what that area would cost to
+        # reclaim. The colour went in the outline rather than across the
+        # interior: washing the whole rectangle in texture filled the screen
+        # with noise and buried the one thing the map is for, which is shape.
+        rating = self.m.dominant_safety(node)
+        if rating:
+            edge = self.tint(rating)
+
         title = clip_end(node.label, max(1, dw - 5))
         top = f"{tl}{RULE} {title} "
         self.put(y, x, top + RULE * max(0, dw - len(top) - 1) + tr, edge)
@@ -3946,7 +4017,7 @@ class Tui:
         then one field per fact, each key in the same gutter as the header's,
         so the eye learns one column and keeps it.
         """
-        self.put(y0, 1, RULE * max(0, w - 2), self.supporting())
+        self.put(y0, 1, RULE * max(0, w - 2), self.muted())
         node = self.focus()
         if node is None:
             return
@@ -4092,8 +4163,8 @@ class Tui:
         # window-sized cursor -- reverse is the cursor, and only the cursor.
         for i in range(bh):
             self.put(y0 + i, x0, " " * bw)
-        self.put(y0, x0, RULE * bw, self.supporting())
-        self.put(y0 + bh - 1, x0, RULE * bw, self.supporting())
+        self.put(y0, x0, RULE * bw, self.muted())
+        self.put(y0 + bh - 1, x0, RULE * bw, self.muted())
         self.put(y0 + 1, x0 + 2, f"andy {DASH} keys", self.heading())
 
         def column(lines, cx, room):
