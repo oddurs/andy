@@ -85,12 +85,23 @@ class Bar(unittest.TestCase):
             self.assertEqual(len(andy.bar(fraction, 12)), 12, fraction)
 
     def test_ends(self):
-        self.assertEqual(andy.bar(0.0, 5), " " * 5)
+        self.assertEqual(andy.bar(0.0, 5), andy.TRACK * 5)
         self.assertEqual(andy.bar(1.0, 5), andy.FULL_CELL * 5)
 
     def test_out_of_range_is_clamped(self):
-        self.assertEqual(andy.bar(-3.0, 4), " " * 4)
+        self.assertEqual(andy.bar(-3.0, 4), andy.TRACK * 4)
         self.assertEqual(andy.bar(9.0, 4), andy.FULL_CELL * 4)
+
+    def test_the_bar_and_its_track_fill_the_width_between_them(self):
+        for fraction in (0.0, 0.01, 0.37, 0.5, 0.99, 1.0):
+            filled, track = andy.bar_parts(fraction, 14)
+            self.assertEqual(len(filled) + len(track), 14, fraction)
+            self.assertEqual(set(track) - {andy.TRACK}, set())
+
+    def test_a_track_is_not_a_rule(self):
+        """An empty bar sits in the same column every row; drawn with the rule
+        character it read as a divider running through the list."""
+        self.assertNotEqual(andy.TRACK, andy.RULE)
 
     @unittest.skipUnless(andy.UNICODE, "ASCII has no eighth-cells to draw with")
     def test_eighth_precision(self):

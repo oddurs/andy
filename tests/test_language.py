@@ -22,6 +22,10 @@ needs_curses = unittest.skipIf(andy.curses is None, "this Python has no curses")
 PALETTE = {"styles"}
 ROLES = {"heading", "content", "supporting", "interactive", "selected",
          "consequence",
+         # the theme's middle tone, for furniture: rules, outlines, bar tracks
+         "muted",
+         # consequence at field strength, for a bar rather than a mark
+         "tint",
          # the cursor's band lent to another role, so a mark on the cursor row
          # keeps its own colour rather than turning into a solid block
          "lift"}
@@ -88,9 +92,10 @@ class OneWayToReachAnAttribute(unittest.TestCase):
         screen = type("S", (), {"getmaxyx": lambda self: (24, 80)})()
         tui = andy.Tui(screen, andy.Model(), None, use_mouse=False)
         tui.styles()
-        for role in sorted(ROLES - {"consequence", "lift"}):
+        for role in sorted(ROLES - {"consequence", "tint", "lift"}):
             self.assertIsInstance(getattr(tui, role)(), int, role)
         self.assertIsInstance(tui.consequence(andy.SAFE), int)
+        self.assertIsInstance(tui.tint(andy.SAFE), int)
         for role in andy.ROLE_NAMES:
             self.assertIsInstance(tui.lift(role), int, f"lift({role})")
 
@@ -155,6 +160,17 @@ class ThePlainTextHalfAgrees(unittest.TestCase):
     def test_magnitude_is_not_coloured_in_the_reports_either(self):
         for name in ("print_report", "print_tree", "print_delta"):
             self.assertNotIn("magnitude", self.function_source(name), name)
+
+    def test_the_accent_is_not_spent_on_data(self):
+        """Cyan means something you can press. The report drew its category
+        bars in it, which made the loudest colour on the page mean nothing."""
+        for name in ("print_report", "print_tree", "print_delta", "print_commands"):
+            self.assertNotIn("ink.accent", self.function_source(name), name)
+
+    def test_every_bar_sits_in_a_track(self):
+        for name in ("print_report",):
+            body = self.function_source(name)
+            self.assertIn("bar_parts", body, f"{name} draws a bar with no track")
 
     def test_plenty_of_free_space_does_not_borrow_the_ratings_green(self):
         self.assertNotIn("else ink.safe", self.function_source("print_report"))

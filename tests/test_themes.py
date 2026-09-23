@@ -6,7 +6,7 @@ import io
 import unittest
 from unittest import mock
 
-from andymod import andy
+from andymod import andy, ANDY
 
 needs_curses = unittest.skipIf(andy.curses is None, "this Python has no curses")
 
@@ -399,3 +399,83 @@ class OneThemeDrivesBothHalves(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@needs_curses
+class Shading(unittest.TestCase):
+    """cairn 0047-0050. The information was right and the surface was flat:
+    five of eight roles carried no colour, the bar had neither track nor hue,
+    and 76% of the coloured characters on screen were the same yellow."""
+
+    def test_there_is_a_tone_between_the_text_and_the_background(self):
+        tui, fake, _ = styled("terminal")
+        muted = andy.ROLE_NAMES.index("muted") + 1
+        self.assertEqual(fake.pairs[muted][0], 8, "muted is not the theme's ANSI 8")
+        self.assertNotEqual(tui.muted(), tui.supporting())
+        self.assertNotEqual(tui.muted(), tui.content())
+
+    def test_the_middle_tone_sits_between_them_in_every_theme(self):
+        """Quiet enough to see past, visible enough to draw a track with."""
+        for name, colours in FAMILY.items():
+            against_bg = andy.contrast(colours[8], colours["bg"])
+            text = andy.contrast(colours["fg"], colours["bg"])
+            self.assertGreater(against_bg, 2.5, name)
+            self.assertLess(against_bg, text / 2, name)
+
+    def test_furniture_uses_it_and_text_does_not(self):
+        source = open(ANDY, encoding="utf-8").read()
+        body = source[source.index("def draw_body"):]
+        self.assertIn("self.muted()", body)
+        for drawing in ("RULE * max(0, w - 2), self.supporting()",):
+            self.assertNotIn(drawing, source, "a rule is still drawn as text")
+
+    def test_a_bar_sits_in_a_track(self):
+        filled, track = andy.bar_parts(0.5, 10)
+        self.assertEqual(len(filled) + len(track), 10)
+        self.assertTrue(set(track) <= {andy.TRACK})
+
+    def test_the_track_is_not_the_rule_character(self):
+        self.assertNotEqual(andy.TRACK, andy.RULE)
+
+    def test_a_tint_is_the_rating_at_field_strength(self):
+        tui, _, _ = styled("terminal")
+        for rating in (andy.SAFE, andy.REBUILD, andy.REVIEW):
+            self.assertNotEqual(tui.tint(rating), tui.consequence(rating),
+                                "the wash and the mark are the same strength")
+            self.assertTrue(tui.tint(rating) & andy.curses.A_DIM)
+
+    def test_a_category_has_no_single_rating_and_takes_no_tint(self):
+        from test_tui import sample_model
+        category = sample_model().categories[0]
+        self.assertFalse(category.cmd or category.path)
+
+    def test_the_dominant_rating_is_the_one_holding_the_bytes(self):
+        m = andy.Model()
+        cat = m.category(andy.PACKAGES)
+        cat.children.append(andy.Node(label="big", path="/a", measured=9 * 2 ** 30,
+                                      cmd="x", safety=andy.REBUILD))
+        cat.children.append(andy.Node(label="small", path="/b", measured=2 ** 20,
+                                      cmd="x", safety=andy.SAFE))
+        m.recompute()
+        self.assertEqual(m.dominant_safety(cat), andy.REBUILD)
+
+    def test_a_rectangle_of_nothing_rated_has_no_dominant(self):
+        m = andy.Model()
+        cat = m.category(andy.PACKAGES)
+        cat.children.append(andy.Node(label="group", kind="g"))
+        m.recompute()
+        self.assertIsNone(m.dominant_safety(cat))
+
+    def test_a_breakdown_is_quieter_than_its_location(self):
+        from test_tui import FakeScreen, sample_model as tui_model, draw
+        screen = FakeScreen(24, 110)
+        tui = andy.Tui(screen, tui_model(), None, use_mouse=False)
+        tui.styles()
+        tui.set_expanded(tui.m.categories, True)
+        tui.build_rows()
+        draw(tui)
+        detail = [text for y, x, text in screen.written if "stable" in text]
+        self.assertTrue(detail, "no breakdown row was drawn")
+        rows = {n.label: (n, d) for n, d, _ in tui.rows}
+        self.assertTrue(rows["stable"][0].detail)
+        self.assertFalse(rows["rustup toolchains"][0].detail)

@@ -102,3 +102,16 @@ Themes that inherit, and a config file.
 - [x] `0044` There is no way to change how andy looks <sup>feature · p1</sup>
 - [x] `0045` Every preference is a flag you must type every time <sup>feature · p1</sup>
 
+## v2.2 — v2.2
+
+`##########` 100% · 4 of 4 done · due 2027-10-31
+
+Shading.
+
+### done
+
+- [x] `0047` There is no tone between the text and the background <sup>feature · p0</sup>
+- [x] `0048` The bar is a floating blob that carries only length <sup>feature · p0</sup>
+- [x] `0049` Everything on the screen reads at the same weight <sup>feature · p1</sup>
+- [x] `0050` The map is a diagram of empty boxes <sup>feature · p1</sup>
+

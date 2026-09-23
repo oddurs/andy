@@ -153,9 +153,17 @@ looking at before a colour means anything, you are reading the column.
 | position | what kind of thing this is — the grid |
 | length | proportion. The bar, and nothing else |
 | weight | structure. **bold** heads, dim supports, normal is content |
+| tone | four steps: heading, content, supporting, muted. Muted is furniture — rules, map outlines, the track behind a bar — and is never text |
 | hue | consequence (green, yellow, red) or interaction (cyan). Never data |
 | reverse | the cursor. Only ever the cursor |
 | glyph | state: open, closed, marked, unmeasured, a floor |
+
+Colour is spent at two strengths, not one. A mark is the hue at full strength,
+because it has one character to say something precise in. A bar is the same hue
+dimmed, because it is a field and a screenful of full-strength bars is a
+warning rather than a picture. Every bar sits in a track drawn in the muted
+tone, so a column of them reads as gauges against a common scale rather than a
+ragged edge.
 
 Magnitude is deliberately absent from that list. The figure states it and the
 bar shows it; colouring it as well said one fact three times, and it was
@@ -195,8 +203,11 @@ up. Cells are outlined in your terminal's own foreground, as below.
  └──────────────────────────────────┘ └───────────────────────────┘ └────┘ └───────┘
 ```
 
-Area carries the magnitude, so the cells only need to be told apart, and an
-outline does that without andy choosing a colour. The `classic` theme shades
+Area carries the magnitude and the frame carries the cost: each cell is
+outlined in the rating that holds the most bytes inside it, so a glance says
+both how big something is and whether it is yours to take. The interior is left
+as air — washing it in texture was tried and buried the shapes, which are the
+thing the map is for. The `classic` theme shades
 them in xterm-256 greys instead, which was the look before 2.1. Every cell is
 labelled either way, so nothing depends on telling two shades apart.
 
